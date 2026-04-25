@@ -26,7 +26,7 @@ Trade-offs to acknowledge upfront:
 |---|---|
 | Long-running container with public HTTPS | **Databricks App** (Docker, gets `<app>.<workspace>.databricksapps.com`) |
 | File persistence (`~/.openclaw`) | **Unity Catalog Volume** mounted as POSIX filesystem |
-| Episodic event store / audit log | **Delta table** in UC, or **Lakebase Postgres** |
+| Episodic event store / audit log | **Delta table** in UC (Lakebase optional on paid editions; not on Free) |
 | Semantic memory (vector search) | **Databricks Vector Search** index |
 | LLM | **Foundation Model API** (Claude Sonnet 4.6, Opus 4.7) — pay-per-token via DBU |
 | Voice transcription | External (Whisper API). FMAPI doesn't ship Whisper today. |
@@ -378,9 +378,73 @@ Databricks pricing is per-DBU rather than flat hourly. Rough monthly estimate fo
 
 ---
 
-## 10. Risks & open questions
+## 10. Running on Databricks Free Edition
 
-- **App restart behavior**: Databricks Apps may restart for platform maintenance. The agent's event log + Volume state survive, but in-flight cognition turns get cut. Mitigation: every turn checkpoint to `events` before tool execution, replay on restart.
+Free Edition (the perpetual no-cost tier that replaced Community Edition) supports almost everything this plan needs — but with three constraints that change the design. Free Edition is the right place to build v1.
+
+### What's supported
+
+| Component | Free Edition |
+|---|---|
+| Databricks Apps | ✅ **1 per account; restarts every 24 h** after start/update/redeploy |
+| Unity Catalog + Volumes | ✅ |
+| Delta tables | ✅ |
+| Foundation Model API (Claude Sonnet/Opus pay-per-token) | ✅ |
+| Vector Search | ✅ 1 endpoint, 1 unit (Direct Vector Access not supported) |
+| Workflows / Jobs | ✅ Max 5 concurrent tasks per account |
+| Secrets API + service principals | ✅ |
+| MLflow Tracing | ✅ |
+
+### What's not supported (forces design changes)
+
+- **Lakebase Postgres** — explicitly unsupported. Use Delta tables only for `events`, `wallet_ledger`, `semantic_facts` (the plan already defaults to Delta).
+- **Custom workspace storage / private networking / egress controls** — Apps reach the public internet directly. Telegram secret-token verification in plugin code becomes mandatory, not optional.
+- **Multiple Apps** — no separate staging + prod. Iterate via Git branches and one redeploy.
+- **Commercial use** — Free Edition is for learning/personal projects. Move to a paid workspace before mainnet wallet activation or any commercial intent.
+
+### Three constraints that reshape the design
+
+**1. The 24-hour App restart**
+
+Every 24 hours after start/update/redeploy, the App is killed and restarted. For a "living" agent this is a daily death/rebirth.
+
+The architecture already externalizes all state (UC Volume + Delta `events`), so the agent resumes coherently — but you need to design *for* the restart:
+
+- **Checkpoint before tool execution.** Every cognition turn writes a `tool_call_pending` event to `events` *before* invoking the tool, and a `tool_call_done` event after. On restart, the cognition loop scans for the latest unfinished turn and replays.
+- **Schedule the restart at a quiet hour.** Trigger a Workflow Job at 04:00 local time daily that calls the Apps API to redeploy. Predictable downtime beats random.
+- **"I just woke up" message.** First heartbeat after a restart sends the user a short recap from `learnings.md` ("I'm back. Yesterday we discussed X. Anything to follow up on?"). Turns the limitation into a feature.
+- **Heartbeat resilience.** Treat any tick gap > 90 s as a probable restart event; don't try to "catch up" missed ticks — just re-enter steady state.
+
+**2. The daily compute quota**
+
+If you exceed the daily compute quota, the **whole workspace shuts down for the rest of the day** (extreme overage = rest of the month). The agent goes silent.
+
+Quota is shared across the App, notebooks, jobs, and SQL warehouses.
+
+- Use the smallest App compute setting available.
+- Throttle the heartbeat to **120 s ticks** instead of 60 s on Free Edition.
+- LLM token spend dominates DBU consumption — enforce a daily token cap in the cognition middleware (already in the plan; tune it tighter).
+- Avoid running notebooks alongside the live agent; do dev work in a separate session window.
+- Don't run the SQL warehouse 24/7 — keep it on auto-stop with a short idle timeout, only used when `uc_query` is called.
+
+**3. One Vector Search unit**
+
+Fine for v1 personal-scale semantic memory (thousands of facts). Skip Vector Search entirely until `learnings.md` stops fitting in context — likely never for a personal agent.
+
+### When to migrate off Free Edition
+
+- Mainnet wallet activation (commercial-use boundary + you want continuous uptime).
+- Daily token cap is no longer covering useful agent activity.
+- You want a staging App alongside prod.
+- You want private networking, audit log retention beyond Free defaults, or SLA.
+
+Migration path: spin up a paid workspace, copy `living_ai.agent` catalog (UC catalog clone), redeploy the App from the same Git ref, update Telegram webhook URL. ~1 hour of work.
+
+---
+
+## 11. Risks & open questions
+
+- **App restart behavior**: Databricks Apps may restart for platform maintenance, and on Free Edition restart every 24 h (see §10). The agent's event log + Volume state survive, but in-flight cognition turns get cut. Mitigation: every turn checkpoint to `events` before tool execution, replay on restart.
 - **UC Volume FUSE quirks**: high-frequency small writes can be slow. Mitigation: buffer episodic writes in memory, flush every N turns or every 30s.
 - **Egress through workspace policies**: if you have strict outbound restrictions, Telegram/Solana/Whisper need explicit allowlist entries.
 - **FMAPI feature parity**: rarely an issue for Claude, but verify prompt caching + tool use behave identically before fully committing.
@@ -390,7 +454,7 @@ Databricks pricing is per-DBU rather than flat hourly. Rough monthly estimate fo
 
 ---
 
-## 11. Definition of done
+## 12. Definition of done
 
 ### v1
 - App deploys from Git, boots OpenClaw, agent introduces itself on Telegram.
@@ -410,7 +474,7 @@ Databricks pricing is per-DBU rather than flat hourly. Rough monthly estimate fo
 
 ---
 
-## 12. Comparison with the EC2 plan
+## 13. Comparison with the EC2 plan
 
 | Dimension | EC2 (`IMPLEMENTATION_PLAN.md`) | Databricks (this plan) |
 |---|---|---|
