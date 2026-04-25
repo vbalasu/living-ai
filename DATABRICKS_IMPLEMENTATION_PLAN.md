@@ -4,6 +4,8 @@ A separate plan for deploying the agent **inside a Databricks workspace** instea
 
 This plan is parallel to (not a replacement for) `IMPLEMENTATION_PLAN.md`. Pick one based on where you want the agent to live.
 
+> **⚠ What actually shipped diverges from this plan.** The deployed v1 (April, on Free Edition) made several pragmatic choices that differ from below: a custom Python FastAPI app instead of OpenClaw, GPT-5.5 instead of Claude (Free Edition FMAPI), Lakebase Postgres instead of Delta tables for events, SDK Files API instead of POSIX `/Volumes/` mounts (Apps don't auto-mount), and several v1 components deferred to v2 (wallet, voice/vision, lakehouse-tools, MLflow tracing, nightly consolidation). See **`DATABRICKS_IMPLEMENTATION_SUMMARY.md`** for the ground-truth state and the deltas table. This plan is preserved as the design vision — the summary is the operational truth.
+
 ---
 
 ## 1. Why deploy on Databricks?
