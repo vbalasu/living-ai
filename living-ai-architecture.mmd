@@ -1,0 +1,192 @@
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "primaryColor": "#eef2ff",
+    "primaryTextColor": "#1e1b4b",
+    "primaryBorderColor": "#818cf8",
+    "lineColor": "#475569",
+    "background": "#ffffff",
+    "mainBkg": "#eef2ff",
+    "nodeBorder": "#818cf8",
+    "clusterBkg": "#f8fafc",
+    "clusterBorder": "#94a3b8",
+    "titleColor": "#0f172a",
+    "edgeLabelBackground": "#ffffffee",
+    "fontFamily": "ui-sans-serif, system-ui, sans-serif",
+    "fontSize": "14px"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "padding": 22,
+    "nodeSpacing": 38,
+    "rankSpacing": 54
+  }
+}}%%
+
+flowchart TB
+
+  %% ═══════════════════════════════════════════════════
+  %%  ROW 1 — OUTSIDE WORLD
+  %% ═══════════════════════════════════════════════════
+  subgraph WORLD["  Outside World  "]
+    direction LR
+    HU["👤 Humans\n(users · operators)"]
+    OA["🤖 Other Agents"]
+    EXT["🔌 External\nServices & APIs"]
+    PAY["💳 Payment Rails\n& Blockchain"]
+    SENS["📡 Sensors &\nData Feeds"]
+  end
+
+  %% ═══════════════════════════════════════════════════
+  %%  ROW 2 — CHANNELS IN
+  %% ═══════════════════════════════════════════════════
+  subgraph CHANIN["  Channels In  ·  inbound stimulus boundary  "]
+    direction LR
+    MSGi["💬 Messaging\nSlack · WA · Email · SMS"]
+    VOCi["🎙️ Voice In"]
+    VISi["👁️ Vision In\nimage / video"]
+    WEBi["🌐 Web / HTTP In"]
+    WIFi["🏦 Wallet Events In"]
+  end
+
+  %% ═══════════════════════════════════════════════════
+  %%  ROW 3 — AGENT INTERNALS
+  %% ═══════════════════════════════════════════════════
+  subgraph AGENT["  Agent Internals  ·  runs on independent compute  "]
+    direction LR
+
+    HB["💓 Heartbeat\nScheduler"]
+
+    subgraph COG["  Cognition Core  "]
+      LLM["⚡ LLM Reasoning\n& Planning"]
+    end
+
+    subgraph SELF["  Self-Model  "]
+      direction TB
+      ID["🪪 Identity\nname · persona"]
+      GL["🎯 Goals\nobjectives"]
+      SM["🧭 State Manager\ncontext · mood · energy\n(↺ self-reflection)"]
+    end
+
+    subgraph MEM["  Memory Subsystem  "]
+      direction TB
+      EP["📖 Episodic"]
+      PR["⚙️ Procedural"]
+      SE["🗂️ Semantic"]
+    end
+
+    subgraph ACT["  Action Layer  "]
+      direction TB
+      SK["🛠️ Skills & Tools\nregistry · MCPs · scripts"]
+      WAL["💰 Wallet / Treasury\nkeys · balance · signing"]
+    end
+
+  end
+
+  %% ═══════════════════════════════════════════════════
+  %%  ROW 4 — CHANNELS OUT
+  %% ═══════════════════════════════════════════════════
+  subgraph CHANOUT["  Channels Out  ·  outbound response boundary  "]
+    direction LR
+    MSGo["💬 Messaging Out"]
+    VOCo["🎙️ Voice Out\nspeech"]
+    WEBo["🌐 API Calls Out"]
+    WALo["💳 Transactions Out"]
+  end
+
+  %% ═══════════════════════════════════════════════════
+  %%  ROW 5 — WORLD OUTBOUND
+  %% ═══════════════════════════════════════════════════
+  subgraph SINKS["  World (outbound)  "]
+    direction LR
+    HUo["👤 Humans\n(reply)"]
+    OAo["🤖 Other Agents\n(reply)"]
+    EXTo["🔌 External APIs\n(call)"]
+    PAYo["💳 Payment Rails\n(tx)"]
+  end
+
+  %% ─────────────────────────────────────────────
+  %%  World → Channels In
+  %% ─────────────────────────────────────────────
+  HU   -->|"message"| MSGi
+  OA   -->|"message"| MSGi
+  HU   -->|"voice"| VOCi
+  HU   -->|"image/video"| VISi
+  EXT  -->|"data/events"| WEBi
+  SENS -->|"stream"| WEBi
+  PAY  -->|"tx confirm"| WIFi
+
+  %% ─────────────────────────────────────────────
+  %%  Channels In → Cognition
+  %% ─────────────────────────────────────────────
+  MSGi -->|"stimulus"| LLM
+  VOCi -->|"stimulus"| LLM
+  VISi -->|"stimulus"| LLM
+  WEBi -->|"stimulus"| LLM
+  WIFi -->|"balance / events"| LLM
+
+  %% ─────────────────────────────────────────────
+  %%  Heartbeat → Cognition
+  %% ─────────────────────────────────────────────
+  HB -->|"tick"| LLM
+
+  %% ─────────────────────────────────────────────
+  %%  Cognition → Self-Model
+  %% ─────────────────────────────────────────────
+  LLM -->|"consult / update"| ID
+  LLM -->|"consult / update"| GL
+  LLM -->|"read / write"| SM
+
+  %% ─────────────────────────────────────────────
+  %%  Cognition ↔ Memory
+  %% ─────────────────────────────────────────────
+  LLM <-->|"store / recall"| EP
+  LLM <-->|"store / recall"| PR
+  LLM <-->|"store / recall"| SE
+
+  %% ─────────────────────────────────────────────
+  %%  Cognition → Actions
+  %% ─────────────────────────────────────────────
+  LLM -->|"invoke"| SK
+  LLM -->|"authorize"| WAL
+
+  %% ─────────────────────────────────────────────
+  %%  Cognition → Channels Out
+  %% ─────────────────────────────────────────────
+  LLM -->|"response"| MSGo
+  LLM -->|"response"| VOCo
+  SK  -->|"API call"| WEBo
+  WAL -->|"tx"| WALo
+
+  %% ─────────────────────────────────────────────
+  %%  Channels Out → World Outbound
+  %% ─────────────────────────────────────────────
+  MSGo -->|"reply"| HUo
+  MSGo -->|"reply"| OAo
+  VOCo -->|"speech"| HUo
+  WEBo -->|"call"| EXTo
+  WALo -->|"tx"| PAYo
+
+  %% ─────────────────────────────────────────────
+  %%  STYLES
+  %% ─────────────────────────────────────────────
+  classDef worldNode   fill:#f1f5f9,stroke:#94a3b8,color:#1e293b
+  classDef chanInNode  fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+  classDef cogNode     fill:#4338ca,stroke:#3730a3,color:#ffffff
+  classDef hbNode      fill:#fce7f3,stroke:#db2777,color:#9d174d
+  classDef selfNode    fill:#fef3c7,stroke:#d97706,color:#78350f
+  classDef memNode     fill:#dcfce7,stroke:#16a34a,color:#14532d
+  classDef actNode     fill:#ccfbf1,stroke:#0d9488,color:#134e4a
+  classDef hostNode    fill:#e2e8f0,stroke:#64748b,color:#334155
+  classDef chanOutNode fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+  classDef sinkNode    fill:#f0fdf4,stroke:#86efac,color:#14532d
+
+  class HU,OA,EXT,PAY,SENS worldNode
+  class MSGi,VOCi,VISi,WEBi,WIFi chanInNode
+  class LLM cogNode
+  class HB hbNode
+  class ID,GL,SM selfNode
+  class EP,PR,SE memNode
+  class SK,WAL actNode
+  class MSGo,VOCo,WEBo,WALo chanOutNode
+  class HUo,OAo,EXTo,PAYo sinkNode
