@@ -220,13 +220,198 @@ All secrets via Docker secrets — never env vars in the image.
 
 ---
 
-## 8. Phased rollout
+## 8. Cloud deployment — EC2
 
-### Phase 0 — OpenClaw running (day 1)
-- `git clone openclaw/openclaw && docker compose up -d`
-- Telegram bot connected via `openclaw-cli`.
+The agent runs 24/7, so it lives on a cloud VM, not a laptop. Smallest viable AWS box that runs OpenClaw + plugins comfortably.
+
+### 8.1 Instance choice
+
+| Option | Specs | $/mo | Notes |
+|---|---|---|---|
+| **`t4g.small`** *(recommended)* | 2 vCPU ARM Graviton, 2 GB RAM | ~$12 | Cheapest sweet spot. Node.js + Docker + Claude API calls fit in 2 GB. ARM64 image works for OpenClaw. |
+| `t3.small` | 2 vCPU x86, 2 GB RAM | ~$15 | Fallback if any OpenClaw plugin ships only x86 native binaries. |
+| `t4g.micro` | 2 vCPU ARM, 1 GB RAM | ~$6 | Risky — Docker pull + Whisper buffering can OOM. Skip. |
+
+- **OS**: Ubuntu 24.04 LTS (Canonical AMI for arm64).
+- **Root volume**: 20 GB gp3 (~$1.60/mo). Plenty for OS + Docker images + memory files for years.
+- **Region**: closest to your channel APIs and yourself; `us-west-2` or `us-east-1` typical.
+
+**Total v1 infra cost: ~$15/mo** (instance + storage + minimal egress). LLM and Solana RPC costs are separate.
+
+### 8.2 Networking — making the agent reachable
+
+The agent needs:
+- **Inbound HTTPS** for channel webhooks (Telegram, Slack, Discord) and OpenClaw admin endpoints.
+- **Egress** to LLM, Solana RPC, channel APIs, Whisper, ElevenLabs.
+- **SSH access** for the operator — but not from the entire Internet.
+
+**Public address**:
+- Allocate one **Elastic IP** (free while attached) and bind to the instance.
+- DNS: a single A record `agent.example.com → <EIP>`. Use Route 53 ($0.50/mo) or any provider; for a free option, **DuckDNS** works for v1.
+
+**Reverse proxy + TLS**:
+- **Caddy** as the front door. Auto-provisions Let's Encrypt certs on first request. One config block, no certbot dance.
+- Caddy listens on 80 (redirect → 443) and 443. Routes:
+  - `/telegram/*` → OpenClaw webhook port
+  - `/slack/*` → OpenClaw webhook port
+  - `/health` → OpenClaw health endpoint
+  - everything else → 404
+
+**Security group**:
+
+| Port | Source | Purpose |
+|---|---|---|
+| 22 | *Operator IP only* — or **closed** if using SSM Session Manager | SSH |
+| 80 | `0.0.0.0/0` | HTTP → HTTPS redirect for Let's Encrypt + Caddy |
+| 443 | `0.0.0.0/0` | Channel webhooks |
+
+All other inbound denied. All outbound allowed (or restrict per the egress allowlist in §6).
+
+**Recommended**: skip port 22 entirely. Use **AWS SSM Session Manager** for shell access — no public SSH surface, IAM-controlled, audit-logged. Attach role `AmazonSSMManagedInstanceCore` to the instance and install `amazon-ssm-agent` (preinstalled on Ubuntu AWS AMIs).
+
+### 8.3 Bootstrap (cloud-init `user-data`)
+
+Pasted into the Launch Instance wizard's *User data* field. Runs once on first boot.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# 1. Base packages
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg ufw fail2ban unattended-upgrades
+
+# 2. Docker (official repo, arm64-aware)
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+usermod -aG docker ubuntu
+
+# 3. Caddy
+apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
+apt-get update -y
+apt-get install -y caddy
+
+# 4. Firewall (defense in depth alongside the SG)
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 80/tcp
+ufw allow 443/tcp
+# ufw allow 22/tcp from <YOUR_IP>   # uncomment only if not using SSM
+ufw --force enable
+
+# 5. Auto security upgrades
+dpkg-reconfigure -f noninteractive unattended-upgrades
+
+# 6. Clone and configure
+sudo -u ubuntu bash <<'EOSU'
+cd ~
+git clone https://github.com/openclaw/openclaw.git
+cd openclaw
+# Place living-ai plugins next to OpenClaw's plugin dir
+mkdir -p ~/.openclaw
+EOSU
+
+# 7. Caddyfile (replace agent.example.com with your domain)
+cat > /etc/caddy/Caddyfile <<'EOF'
+agent.example.com {
+    encode gzip
+    reverse_proxy /telegram/* localhost:3000
+    reverse_proxy /slack/*    localhost:3000
+    reverse_proxy /health     localhost:3000
+}
+EOF
+systemctl reload caddy
+
+# 8. systemd unit to keep OpenClaw running
+cat > /etc/systemd/system/openclaw.service <<'EOF'
+[Unit]
+Description=OpenClaw living-ai agent
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/ubuntu/openclaw
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable openclaw.service
+```
+
+After boot, finish manually (one-time):
+1. `aws ssm start-session --target <instance-id>` (or SSH if enabled).
+2. Drop secrets into `/home/ubuntu/openclaw/secrets/` (channel tokens, RPC key, wallet passphrase).
+3. Drop `identity.md` and `goals.md` into `~/.openclaw/`.
+4. `systemctl start openclaw`.
+5. Configure Telegram webhook: `curl -F "url=https://agent.example.com/telegram/<bot-id>" https://api.telegram.org/bot<TOKEN>/setWebhook`.
+
+### 8.4 IAM role for the instance
+
+Minimal `InstanceProfile` policies:
+- `AmazonSSMManagedInstanceCore` — Session Manager access.
+- A custom inline policy granting `s3:PutObject`/`GetObject` on `s3://living-ai-backups/<instance-id>/*` for backups (next section).
+
+No AWS keys baked into the image.
+
+### 8.5 Backups
+
+- **Daily EBS snapshot** via AWS Data Lifecycle Manager (DLM) — 7 daily, 4 weekly, 3 monthly. Free policy; storage costs ~$0.05/GB/mo for changed blocks.
+- **Application-level**: `restic` cron job on the instance writes encrypted snapshots of `~/.openclaw` and `/secrets` to S3 nightly. Restic password in SSM Parameter Store.
+- **Wallet keystore**: also kept in an offline encrypted backup (your password manager). Don't rely solely on cloud snapshots.
+
+### 8.6 Monitoring & operations
+
+- **CloudWatch Agent** ships `/var/log/syslog` and `~/openclaw/logs/*.jsonl` to CloudWatch Logs. Free tier covers v1.
+- **CloudWatch alarm**: alert if instance status check fails or if a custom heartbeat metric (pushed by OpenClaw every tick) goes stale > 5 min.
+- **Uptime**: `systemd` keeps OpenClaw running; instance autostart on boot. EC2 itself stays up unless AWS schedules retirement (rare; gets a 2-week warning email).
+
+### 8.7 Upgrade path
+
+| Trigger | Move to |
+|---|---|
+| Sustained CPU > 70% or memory pressure | `t4g.medium` (4 GB), no other changes |
+| Need HA / zero-downtime updates | Two instances behind ALB, shared EFS for `/data`, leader election |
+| Plugin requires GPU (local Whisper, local model) | `g5g.xlarge` (ARM + T4g GPU) — but stay on cloud APIs in v1 |
+
+### 8.8 Cost summary (v1, monthly)
+
+| Item | Cost |
+|---|---|
+| `t4g.small` on-demand | ~$12 |
+| 20 GB gp3 root | ~$1.60 |
+| Elastic IP (attached) | $0 |
+| Egress data (light) | ~$1 |
+| EBS snapshots (delta) | ~$1 |
+| Route 53 hosted zone (optional) | $0.50 |
+| **Infra subtotal** | **~$15–17/mo** |
+| LLM API (Claude, est.) | $20–100 |
+| Solana RPC (Helius free tier) | $0 |
+| Whisper / ElevenLabs (light usage) | $0–5 |
+
+---
+
+## 9. Phased rollout
+
+### Phase 0 — EC2 + OpenClaw running (day 1)
+- Launch `t4g.small` Ubuntu 24.04 with the cloud-init script above.
+- Allocate Elastic IP, point DNS at it, verify Caddy serves HTTPS.
+- `docker compose up -d` (auto via systemd).
+- Telegram bot connected via `openclaw-cli`; webhook pointed at `https://agent.example.com/telegram/...`.
 - `identity.md` and `goals.md` populated.
-- Agent introduces itself on Telegram.
+- Agent introduces itself on Telegram from the cloud.
 
 ### Phase 1 — Goals + initiative (day 2)
 - Goals plugin (read/add/complete tools).
@@ -261,7 +446,7 @@ All secrets via Docker secrets — never env vars in the image.
 
 ---
 
-## 9. Tech choices
+## 10. Tech choices
 
 | Concern | Choice | Why |
 |---|---|---|
@@ -274,11 +459,14 @@ All secrets via Docker secrets — never env vars in the image.
 | Voice TTS | ElevenLabs | Natural voice |
 | Memory | OpenClaw MD files | Per Hermes / file-memory research, beats vectors at this scale |
 | Secrets | Docker secrets | No env vars in image |
-| Backup | restic → S3 | Encrypted, deduplicated |
+| Backup | restic → S3 + EBS snapshots via DLM | Encrypted, deduplicated, off-instance |
+| Host | AWS EC2 `t4g.small` Ubuntu 24.04 | Smallest viable; ARM = cheapest |
+| Reverse proxy | Caddy | Auto Let's Encrypt, single config block |
+| Shell access | AWS SSM Session Manager | No public SSH surface |
 
 ---
 
-## 10. Risks & open questions
+## 11. Risks & open questions
 
 - **Cost runaway.** Misbehaving heartbeat could burn LLM tokens. Mitigation: daily token budget enforced by middleware; agent gets `budget_remaining` in context.
 - **Wallet compromise.** Encrypted keystore + Docker secret passphrase is decent for a personal agent on a personal machine. For production, use a hardware signer or Solana's `solana-keygen` with FIDO2.
@@ -290,7 +478,7 @@ All secrets via Docker secrets — never env vars in the image.
 
 ---
 
-## 11. Definition of done for v1
+## 12. Definition of done for v1
 
 - `docker compose up` boots OpenClaw with our plugins.
 - Agent introduces itself on Telegram with persona from `identity.md`.
@@ -318,3 +506,6 @@ All secrets via Docker secrets — never env vars in the image.
 - [USDC on Solana (Circle docs)](https://www.circle.com/en/usdc-multichain/solana)
 - [Helius RPC](https://helius.dev/)
 - [Hermes Agent — file-based memory](https://github.com/mudrii/hermes-agent-docs)
+- [Caddy — automatic HTTPS](https://caddyserver.com/docs/automatic-https)
+- [AWS Graviton / t4g pricing](https://aws.amazon.com/ec2/instance-types/t4/)
+- [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
