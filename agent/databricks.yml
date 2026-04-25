@@ -1,0 +1,50 @@
+bundle:
+  name: living-ai
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Catalog where the agent's schema, volumes, and tables live.
+    default: workspace
+  schema:
+    description: Schema name under the catalog.
+    default: living_ai
+  app_name:
+    description: Databricks App name (must be unique in the workspace).
+    default: living-ai
+  agent_name:
+    description: The agent's chosen name. Used in identity and greetings.
+    default: April
+  fmapi_endpoint:
+    description: Foundation Model API serving endpoint to use for cognition.
+    default: databricks-gpt-5-5
+  heartbeat_seconds:
+    description: Seconds between heartbeat ticks. Free Edition defaults to 120s for quota safety.
+    default: 120
+  daily_token_cap:
+    description: Hard cap on LLM tokens spent per UTC day.
+    default: 200000
+  secrets_scope:
+    description: Databricks Secrets scope holding channel + wallet keys. Created out-of-band.
+    default: living_ai
+
+targets:
+  free:
+    default: true
+    workspace:
+      host: https://dbc-d5a49298-395d.cloud.databricks.com
+      profile: free
+    variables:
+      heartbeat_seconds: 120
+      daily_token_cap: 100000
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-d5a49298-395d.cloud.databricks.com
+      profile: free
+    variables:
+      heartbeat_seconds: 60
+      daily_token_cap: 500000

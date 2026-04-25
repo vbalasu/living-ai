@@ -1,0 +1,27 @@
+command:
+  - "uvicorn"
+  - "app:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
+
+env:
+  - name: AGENT_NAME
+    value: "April"
+  - name: CATALOG
+    value: "workspace"
+  - name: SCHEMA
+    value: "living_ai"
+  - name: CONFIG_VOLUME_PATH
+    value: "/Volumes/workspace/living_ai/config"
+  - name: WORKSPACE_VOLUME_PATH
+    value: "/Volumes/workspace/living_ai/workspace_dir"
+  - name: FMAPI_ENDPOINT
+    value: "databricks-gpt-5-5"
+  - name: HEARTBEAT_SECONDS
+    value: "120"
+  - name: DAILY_TOKEN_CAP
+    value: "100000"
+  - name: SECRETS_SCOPE
+    value: "living_ai"

@@ -1,0 +1,12 @@
+resources:
+  jobs:
+    setup_tables:
+      name: living-ai-setup-tables
+      description: "One-time idempotent DDL for ${var.agent_name}'s Delta tables. Re-run safe."
+      tasks:
+        - task_key: create_tables
+          notebook_task:
+            notebook_path: ../sql/setup_notebook.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.agent_schema.name}

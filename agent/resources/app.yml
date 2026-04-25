@@ -1,0 +1,6 @@
+resources:
+  apps:
+    living_ai_app:
+      name: ${var.app_name}
+      description: "Living AI agent (${var.agent_name}) on Databricks Apps with FMAPI cognition."
+      source_code_path: ../src

@@ -1,0 +1,15 @@
+resources:
+  volumes:
+    config_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.agent_schema.name}
+      name: config
+      volume_type: MANAGED
+      comment: "Config dir for ${var.agent_name}: identity.md, goals.md, learnings.md, episodes/."
+
+    workspace_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.agent_schema.name}
+      name: workspace_dir
+      volume_type: MANAGED
+      comment: "Working files for ${var.agent_name}: voice cache, vision cache, scratch."
