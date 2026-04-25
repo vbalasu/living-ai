@@ -25,3 +25,5 @@ env:
     value: "100000"
   - name: SECRETS_SCOPE
     value: "living_ai"
+  - name: LAKEBASE_INSTANCE
+    value: "april-db"

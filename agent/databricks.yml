@@ -29,6 +29,9 @@ variables:
   secrets_scope:
     description: Databricks Secrets scope holding channel + wallet keys. Created out-of-band.
     default: living_ai
+  lakebase_instance:
+    description: Lakebase database instance name for events, wallet ledger, semantic facts.
+    default: april-db
 
 targets:
   free:

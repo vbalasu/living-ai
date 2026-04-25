@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "living-ai-deploy"
+version = "0.1.0"
+description = "Single-binary deployer for the living-ai agent into a Databricks workspace."
+requires-python = ">=3.11"
+dependencies = [
+    "databricks-sdk==0.40.0",
+]
+
+[project.scripts]
+living-ai-deploy = "living_ai_deploy.deployer:main"
+
+[tool.setuptools.packages.find]
+include = ["living_ai_deploy*"]
+
+[tool.setuptools.package-data]
+living_ai_deploy = ["bundle_files/**/*"]

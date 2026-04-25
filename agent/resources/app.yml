@@ -4,3 +4,39 @@ resources:
       name: ${var.app_name}
       description: "Living AI agent (${var.agent_name}) on Databricks Apps with FMAPI cognition."
       source_code_path: ../src
+      resources:
+        - name: config-volume
+          description: "Config dir: identity, goals, learnings, episodes"
+          uc_securable:
+            securable_full_name: ${var.catalog}.${var.schema}.config
+            securable_type: VOLUME
+            permission: WRITE_VOLUME
+        - name: workspace-volume
+          description: "Working files: voice cache, vision cache, scratch"
+          uc_securable:
+            securable_full_name: ${var.catalog}.${var.schema}.workspace_dir
+            securable_type: VOLUME
+            permission: WRITE_VOLUME
+        - name: fmapi-endpoint
+          description: "Foundation Model API endpoint for cognition"
+          serving_endpoint:
+            name: ${var.fmapi_endpoint}
+            permission: CAN_QUERY
+        - name: telegram-bot-token
+          description: "Telegram bot token"
+          secret:
+            scope: ${var.secrets_scope}
+            key: telegram_bot_token
+            permission: READ
+        - name: telegram-user-handle
+          description: "Primary Telegram user handle"
+          secret:
+            scope: ${var.secrets_scope}
+            key: telegram_primary_user_handle
+            permission: READ
+        - name: telegram-webhook-secret
+          description: "Secret token for verifying Telegram webhooks"
+          secret:
+            scope: ${var.secrets_scope}
+            key: telegram_webhook_secret
+            permission: READ

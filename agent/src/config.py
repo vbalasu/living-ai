@@ -14,6 +14,7 @@ class Config:
     heartbeat_seconds: int
     daily_token_cap: int
     secrets_scope: str
+    lakebase_instance: str | None
     telegram_token_secret_key: str = "telegram_bot_token"
     telegram_user_handle_secret_key: str = "telegram_primary_user_handle"
 
@@ -29,4 +30,5 @@ def load() -> Config:
         heartbeat_seconds=int(os.environ.get("HEARTBEAT_SECONDS", "120")),
         daily_token_cap=int(os.environ.get("DAILY_TOKEN_CAP", "100000")),
         secrets_scope=os.environ.get("SECRETS_SCOPE", "living_ai"),
+        lakebase_instance=os.environ.get("LAKEBASE_INSTANCE") or None,
     )
