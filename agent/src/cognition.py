@@ -1,4 +1,11 @@
-"""Cognition core: builds context, calls FMAPI GPT-5.5, returns a response."""
+"""Cognition core: builds context, calls the configured serving endpoint, returns a response.
+
+Both Databricks Foundation Model API endpoints (e.g. databricks-qwen3-next-80b-a3b-instruct,
+which is available on Free Edition) and user-created external model endpoints (OpenAI,
+Anthropic, Bedrock, etc.) speak the same OpenAI-protocol API surface, so we always use
+WorkspaceClient.serving_endpoints.get_open_ai_client(). Picking a different LLM is just
+a matter of changing the LLM_ENDPOINT env var.
+"""
 from __future__ import annotations
 
 import json
@@ -85,7 +92,7 @@ class Cognition:
 
         try:
             resp = self.client().chat.completions.create(
-                model=self.cfg.fmapi_endpoint,
+                model=self.cfg.llm_endpoint,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
@@ -103,7 +110,7 @@ class Cognition:
             self.memory.append_event(
                 kind="error",
                 channel=channel,
-                payload={"error": str(exc), "stage": "fmapi_call"},
+                payload={"error": str(exc), "stage": "llm_call"},
             )
             return {"text": f"({self.cfg.agent_name} hit an error and is recovering.)", "error": str(exc)}
 

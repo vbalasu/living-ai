@@ -10,7 +10,7 @@ class Config:
     schema: str
     config_volume_path: str
     workspace_volume_path: str
-    fmapi_endpoint: str
+    llm_endpoint: str
     heartbeat_seconds: int
     daily_token_cap: int
     secrets_scope: str
@@ -26,7 +26,7 @@ def load() -> Config:
         schema=os.environ["SCHEMA"],
         config_volume_path=os.environ["CONFIG_VOLUME_PATH"],
         workspace_volume_path=os.environ["WORKSPACE_VOLUME_PATH"],
-        fmapi_endpoint=os.environ.get("FMAPI_ENDPOINT", "databricks-gpt-5-5"),
+        llm_endpoint=os.environ.get("LLM_ENDPOINT", "databricks-qwen3-next-80b-a3b-instruct"),
         heartbeat_seconds=int(os.environ.get("HEARTBEAT_SECONDS", "120")),
         daily_token_cap=int(os.environ.get("DAILY_TOKEN_CAP", "100000")),
         secrets_scope=os.environ.get("SECRETS_SCOPE", "living_ai"),

@@ -17,9 +17,14 @@ variables:
   agent_name:
     description: The agent's chosen name. Used in identity and greetings.
     default: April
-  fmapi_endpoint:
-    description: Foundation Model API serving endpoint to use for cognition.
-    default: databricks-gpt-5-5
+  llm_endpoint:
+    description: |
+      Serving endpoint name used for cognition. Default is the FMAPI Qwen 3
+      OSS endpoint, which is available on Databricks Free Edition. To use
+      a non-OSS provider (OpenAI, Anthropic, Bedrock, etc.), create an
+      external model serving endpoint per the docs and pass its name here.
+      https://docs.databricks.com/aws/en/generative-ai/external-models/
+    default: databricks-qwen3-next-80b-a3b-instruct
   heartbeat_seconds:
     description: Seconds between heartbeat ticks. Free Edition defaults to 120s for quota safety.
     default: 120
@@ -27,7 +32,7 @@ variables:
     description: Hard cap on LLM tokens spent per UTC day.
     default: 200000
   secrets_scope:
-    description: Databricks Secrets scope holding channel + wallet keys. Created out-of-band.
+    description: Databricks Secrets scope holding channel keys. Created out-of-band.
     default: living_ai
   lakebase_instance:
     description: Lakebase database instance name for events, wallet ledger, semantic facts.

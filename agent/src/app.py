@@ -48,8 +48,8 @@ async def lifespan(app: FastAPI):
 
     task = asyncio.create_task(heartbeat_loop(cfg, memory, cognition, on_proactive))
 
-    log.info("agent %s online; tick=%ss; fmapi=%s; telegram=%s",
-             cfg.agent_name, cfg.heartbeat_seconds, cfg.fmapi_endpoint,
+    log.info("agent %s online; tick=%ss; llm=%s; telegram=%s",
+             cfg.agent_name, cfg.heartbeat_seconds, cfg.llm_endpoint,
              "configured" if telegram else "pending")
 
     yield
@@ -69,7 +69,7 @@ async def root():
     cfg = app.state.cfg
     return {
         "agent": cfg.agent_name,
-        "fmapi": cfg.fmapi_endpoint,
+        "llm_endpoint": cfg.llm_endpoint,
         "heartbeat_seconds": cfg.heartbeat_seconds,
         "telegram": "configured" if app.state.telegram else "pending",
     }
