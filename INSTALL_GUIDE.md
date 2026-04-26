@@ -313,6 +313,7 @@ Practical implications:
 | `Could not find env entry for X in app.yaml`                           | The bundled `app.yaml` is out of sync with the deployer. Rebuild the .pex (Section 10).                                    |
 | `bundle deploy` fails with a Terraform error                           | Install Terraform 1.5+ and put it on your `PATH`.                                                                          |
 | Agent runs but never replies on Telegram                               | See "Telegram bot doesn't respond" below.                                                                                  |
+| Agent DMs you a "checking in" message every heartbeat                  | Idle-reflection guard misfiring. Pull the latest .pex and redeploy — the fix scans past tick events to find the last stimulus/response. |
 | You want to wipe and start over                                        | `./living-ai-deploy.pex uninstall`, then `./living-ai-deploy.pex --reset`.                                                 |
 
 ### Telegram bot doesn't respond

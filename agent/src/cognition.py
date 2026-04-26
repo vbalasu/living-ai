@@ -122,13 +122,26 @@ class Cognition:
         )
         return {"text": text, "usage": usage}
 
+    IDLE_REFLECTION_INTERVAL_SECONDS = 1800
+
     def idle_reflection(self) -> dict[str, Any] | None:
-        """Called on idle ticks. Returns a response only if the agent decides to act."""
-        recent = self.memory.recent_events(limit=10)
-        if recent and recent[0]["kind"] in ("stimulus", "response"):
-            ts = datetime.fromisoformat(recent[0]["ts"].replace("Z", "+00:00"))
+        """Called on idle ticks. Returns a response only if the agent decides to act.
+
+        Skips if any stimulus/response — including the previous idle reflection's
+        own response — happened within IDLE_REFLECTION_INTERVAL_SECONDS. We must
+        scan past tick events at the head of the log: heartbeat_loop appends a
+        tick event right before calling us, so recent_events()[0] is always a
+        tick, not a stimulus/response.
+        """
+        recent = self.memory.recent_events(limit=50)
+        last_io = next(
+            (e for e in recent if e.get("kind") in ("stimulus", "response")),
+            None,
+        )
+        if last_io and last_io.get("ts"):
+            ts = datetime.fromisoformat(last_io["ts"].replace("Z", "+00:00"))
             elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
-            if elapsed < 1800:
+            if elapsed < self.IDLE_REFLECTION_INTERVAL_SECONDS:
                 return None
 
         prompt = (
