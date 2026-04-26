@@ -287,67 +287,6 @@ def ensure_secrets(w: WorkspaceClient, scope: str, kvs: dict[str, str]) -> None:
             print(f"  set secret '{scope}/{k}'")
 
 
-def _instance_state(inst) -> str:
-    """Normalize a DatabaseInstance.state value to a bare string like 'AVAILABLE'."""
-    raw = getattr(inst, "state", None) or getattr(inst, "lifecycle_state", None)
-    if raw is None:
-        return ""
-    # SDK returns an enum; .value works for that, str() works for plain strings.
-    s = getattr(raw, "value", None) or str(raw)
-    # str() on an enum yields 'DATABASEINSTANCESTATE.AVAILABLE'; trim that prefix.
-    return s.split(".")[-1].upper()
-
-
-def ensure_lakebase_instance(w: WorkspaceClient, instance_name: str,
-                             capacity: str = "CU_1", timeout_seconds: int = 600) -> None:
-    """Make sure a Lakebase Postgres instance exists, creating + waiting if needed."""
-    import time
-
-    try:
-        existing = w.database.get_database_instance(instance_name)
-        state = _instance_state(existing)
-        print(f"  Lakebase instance '{instance_name}' already exists (state: {state or '?'})")
-        if state == "AVAILABLE":
-            return
-        # Otherwise fall through and wait below.
-    except Exception:
-        # Doesn't exist — create it.
-        print(f"  creating Lakebase instance '{instance_name}' (capacity {capacity}) …")
-        try:
-            from databricks.sdk.service.database import DatabaseInstance
-            w.database.create_database_instance(
-                DatabaseInstance(name=instance_name, capacity=capacity),
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not create Lakebase instance '{instance_name}': {exc}"
-            ) from exc
-
-    print(f"  waiting for Lakebase instance to become AVAILABLE (this can take ~3-5 minutes) …")
-    deadline = time.time() + timeout_seconds
-    last_state = None
-    while time.time() < deadline:
-        try:
-            inst = w.database.get_database_instance(instance_name)
-            state = _instance_state(inst)
-            if state != last_state:
-                print(f"    state: {state or '?'}")
-                last_state = state
-            if state == "AVAILABLE":
-                return
-            if state in ("FAILED", "DELETING", "DELETED"):
-                raise RuntimeError(f"Lakebase instance '{instance_name}' is in state {state}")
-        except Exception as exc:
-            if "not found" in str(exc).lower():
-                pass
-            else:
-                print(f"    poll error: {exc}")
-        time.sleep(15)
-    raise RuntimeError(
-        f"Timed out after {timeout_seconds}s waiting for Lakebase instance '{instance_name}'"
-    )
-
-
 def read_secret(w: WorkspaceClient, scope: str, key: str) -> str | None:
     try:
         raw = w.secrets.get_secret(scope=scope, key=key).value
@@ -384,7 +323,29 @@ _TRANSIENT_PATTERNS = (
     "503 Service Unavailable",
     "502 Bad Gateway",
     "504 Gateway Timeout",
+    # TCP socket-level timeouts (BSD/macOS) and TLS hiccups during long polls
+    # that the Databricks CLI does on `bundle run` for Apps.
+    "operation timed out",
+    "TLS handshake timeout",
+    "read tcp",
 )
+
+
+def _stream_subprocess(cmd: list[str], env: dict, cwd: Path | None) -> tuple[int, str]:
+    """Run cmd, streaming stdout/stderr in real time and capturing for retry detection."""
+    proc = subprocess.Popen(
+        cmd, env=env, cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        bufsize=1, text=True,
+    )
+    captured: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        captured.append(line)
+    proc.wait()
+    return proc.returncode, "".join(captured)
 
 
 def run_databricks(cli: str, args: list[str], profile: str,
@@ -406,24 +367,18 @@ def run_databricks(cli: str, args: list[str], profile: str,
     print(f"  $ {' '.join(cmd)}")
     attempt = 0
     while True:
-        log_path = Path(tempfile.gettempdir()) / "living-ai-databricks.log"
-        with open(log_path, "wb") as f:
-            res = subprocess.run(cmd, env=env, cwd=str(cwd) if cwd else None,
-                                 stdout=f, stderr=subprocess.STDOUT)
-        log_text = log_path.read_text(errors="replace")
-        sys.stdout.write(log_text)
-        sys.stdout.flush()
-        if res.returncode == 0:
+        rc, log_text = _stream_subprocess(cmd, env, cwd)
+        if rc == 0:
             return
         if attempt >= max_transient_retries:
-            raise RuntimeError(f"`databricks {' '.join(args)}` failed (exit {res.returncode})")
+            raise RuntimeError(f"`databricks {' '.join(args)}` failed (exit {rc})")
         if any(p in log_text for p in _TRANSIENT_PATTERNS):
             attempt += 1
             print(f"  transient API error detected — retrying ({attempt}/{max_transient_retries}) in 15s …")
             import time as _t
             _t.sleep(15)
             continue
-        raise RuntimeError(f"`databricks {' '.join(args)}` failed (exit {res.returncode})")
+        raise RuntimeError(f"`databricks {' '.join(args)}` failed (exit {rc})")
 
 
 def _terraform_version(tf_path: str) -> str:
@@ -542,7 +497,7 @@ def _next_lakebase_name(name: str) -> str:
 
 def _deploy_with_app_retry(cli: str, *, profile: str, tf_exec_path: str | None,
                            cwd: Path, w: WorkspaceClient, app_name: str,
-                           snapshot: dict, bundle_dir: Path, capture_log: Path,
+                           snapshot: dict, bundle_dir: Path,
                            max_retries: int = 4) -> None:
     """Run `databricks bundle deploy` with auto-recovery for two known transient issues:
 
@@ -556,26 +511,20 @@ def _deploy_with_app_retry(cli: str, *, profile: str, tf_exec_path: str | None,
 
     Other failure modes pass through unchanged.
     """
+    env = os.environ.copy()
+    if tf_exec_path:
+        env["DATABRICKS_TF_EXEC_PATH"] = tf_exec_path
+        env["DATABRICKS_TF_VERSION"] = _terraform_version(tf_exec_path)
     attempt = 0
     while True:
-        var_args = bundle_var_args(snapshot)
-        capture_log.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [cli, "--profile", profile, "bundle", "deploy", "-t", "free"] + var_args
-        env = os.environ.copy()
-        if tf_exec_path:
-            env["DATABRICKS_TF_EXEC_PATH"] = tf_exec_path
-            env["DATABRICKS_TF_VERSION"] = _terraform_version(tf_exec_path)
+        cmd = [cli, "--profile", profile, "bundle", "deploy", "-t", "free"] + bundle_var_args(snapshot)
         print(f"  $ {' '.join(cmd)}")
-        with open(capture_log, "wb") as f:
-            res = subprocess.run(cmd, env=env, cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT)
-        log_text = capture_log.read_text(errors="replace")
-        sys.stdout.write(log_text)
-        sys.stdout.flush()
-        if res.returncode == 0:
+        rc, log_text = _stream_subprocess(cmd, env, cwd)
+        if rc == 0:
             return
 
         if attempt >= max_retries:
-            raise RuntimeError(f"`bundle deploy` failed after {attempt + 1} attempts (exit {res.returncode})")
+            raise RuntimeError(f"`bundle deploy` failed after {attempt + 1} attempts (exit {rc})")
 
         # Lakebase name collision — increment suffix and retry.
         if "Instance name is not unique" in log_text and "database_instance" in log_text:
@@ -605,7 +554,7 @@ def _deploy_with_app_retry(cli: str, *, profile: str, tf_exec_path: str | None,
             continue
 
         # Unrecognized failure — surface to caller.
-        raise RuntimeError(f"`bundle deploy` failed (exit {res.returncode})")
+        raise RuntimeError(f"`bundle deploy` failed (exit {rc})")
 
 
 def _app_compute_state(w: WorkspaceClient, app_name: str) -> str | None:
@@ -720,6 +669,13 @@ def parse_args(argv: list[str]) -> dict:
 # --- main entry ---
 
 def main() -> None:
+    # Line-buffer stdout so progress prints land in real time when output is
+    # piped (tee, file redirect, CI logs). Default is block-buffered for non-TTYs.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     args = parse_args(sys.argv)
 
     if args["print_config"]:
@@ -887,13 +843,18 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
     )
 
     # See if we already have a working bot in Databricks Secrets from a prior install.
+    # We check whenever we have a usable workspace profile, even without a saved config —
+    # uninstall removes the local config but the user typically keeps the secret scope
+    # (so reinstall can reuse the bot without re-pasting the token).
     existing_bot_username = ""
     existing_bot_token = ""
-    if saved and reuse_creds:
+    existing_user_handle = ""
+    if reuse_creds:
         try:
             tmp_w = WorkspaceClient(profile=profile)
-            existing_bot_token = read_secret(tmp_w, saved.get("secrets_scope", "living_ai"),
-                                             "telegram_bot_token") or ""
+            scope = saved.get("secrets_scope", "living_ai")
+            existing_bot_token = read_secret(tmp_w, scope, "telegram_bot_token") or ""
+            existing_user_handle = read_secret(tmp_w, scope, "telegram_primary_user_handle") or ""
             if existing_bot_token:
                 info = telegram_get_me(existing_bot_token)
                 if info and info.get("username"):
@@ -926,9 +887,10 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
                 print("Aborted.", file=sys.stderr)
                 sys.exit(1)
 
-    # Telegram user handle: only show a default if we have one from the same workspace
-    # AND the user is reusing those credentials (i.e. we believe the saved value is theirs).
-    handle_default = saved.get("telegram_user_handle") if (saved and reuse_creds) else None
+    # Telegram user handle default — prefer saved local config, then secrets, otherwise prompt fresh.
+    handle_default = (
+        saved.get("telegram_user_handle") if (saved and reuse_creds) else None
+    ) or (existing_user_handle if reuse_creds else None)
     user_handle = prompts.ask(
         "Your Telegram username (without the @)",
         default=handle_default,
@@ -1077,7 +1039,6 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
         w=w, app_name=app_name,
         snapshot=snapshot,
         bundle_dir=bundle_dir,
-        capture_log=Path(tempfile.gettempdir()) / "living-ai-bundle-deploy.log",
     )
     # snapshot may have been mutated by the retry logic — refresh local var.
     lakebase_name = snapshot["lakebase_instance"]
@@ -1188,7 +1149,7 @@ def run_uninstall() -> None:
     print("Plan:")
     print(f"  Run `databricks bundle destroy` for app '{app_name}'")
     print(f"  Catalog/schema:  {catalog}.{schema} (volumes + tables removed by bundle destroy)")
-    print(f"  Lakebase:        {lakebase} — choose below whether to delete the instance too")
+    print(f"  Lakebase:        {lakebase} (also removed; conversation history will be lost)")
     print(f"  Secrets scope:   {secrets_scope}")
     print(f"  Saved config:    {CONFIG_FILE}")
     print()
@@ -1205,11 +1166,6 @@ def run_uninstall() -> None:
         sys.exit(1)
 
     delete_webhook = prompts.ask_yn("Delete the Telegram webhook?", default=True)
-    delete_lakebase = prompts.ask_yn(
-        f"Delete the Lakebase instance '{lakebase}'? "
-        f"(this also deletes all conversation history)",
-        default=True,
-    )
     delete_scope = prompts.ask_yn(
         f"Delete the entire secrets scope '{secrets_scope}'?",
         default=False,
@@ -1254,13 +1210,20 @@ def run_uninstall() -> None:
     print("\n[2b] Confirming app deletion")
     _wait_for_app_gone(w, app_name)
 
-    if delete_lakebase:
-        print(f"\n[3a] Deleting Lakebase instance '{lakebase}'")
-        try:
-            w.database.delete_database_instance(name=lakebase, purge=True)
-            print(f"  deleted Lakebase instance '{lakebase}'")
-        except Exception as exc:
-            print(f"  could not delete Lakebase instance '{lakebase}': {exc}")
+    # Best-effort: hard-purge Lakebase so the name is reusable immediately.
+    # bundle destroy soft-deletes the instance (~7-day name reservation); a
+    # second SDK call with purge=True frees the name. Silent on "not found"
+    # because the bundle may have already removed it for legacy users.
+    print(f"\n[2c] Purging Lakebase instance '{lakebase}'")
+    try:
+        w.database.delete_database_instance(name=lakebase, purge=True)
+        print(f"  purged '{lakebase}' (name available for reuse)")
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg:
+            print(f"  '{lakebase}' already gone")
+        else:
+            print(f"  could not purge '{lakebase}': {exc}")
 
     if delete_scope:
         print("\n[3] Deleting secrets scope")
