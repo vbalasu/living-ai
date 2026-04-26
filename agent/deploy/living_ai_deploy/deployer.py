@@ -492,6 +492,50 @@ def delete_telegram_webhook(token: str) -> bool:
         return False
 
 
+def _wait_for_app_gone(w: WorkspaceClient, app_name: str,
+                       timeout_seconds: int = 1800) -> None:
+    """Poll until `apps get` 404s.
+
+    `bundle destroy` returns as soon as the API has accepted the delete, but
+    Databricks Apps cleanup can stall in DELETING and even flip to ERROR
+    before the resource fully disappears. When that happens, an explicit
+    `apps delete` after the platform's 20-min cooldown unsticks it.
+    """
+    import time
+    start = time.time()
+    last_state = None
+    last_explicit_delete = 0.0
+    while time.time() - start < timeout_seconds:
+        try:
+            app = w.apps.get(app_name)
+        except Exception:
+            print(f"  app '{app_name}' is gone")
+            return
+        compute = getattr(getattr(app, "compute_status", None), "state", None)
+        state = getattr(compute, "value", None) or str(compute or "?")
+        state = state.split(".")[-1].upper()
+        if state != last_state:
+            print(f"  compute={state}")
+            last_state = state
+        # If the platform reported ERROR or any non-DELETING terminal state,
+        # nudge it with an explicit delete (rate-limited to once per ~5 min so
+        # we don't trip the platform's 20-min cooldown error storm).
+        if state and state != "DELETING":
+            now = time.time()
+            if now - last_explicit_delete > 300:
+                last_explicit_delete = now
+                try:
+                    w.apps.delete(app_name)
+                    print("  retry-delete sent")
+                except Exception as exc:
+                    msg = str(exc)
+                    if "Cannot delete" not in msg:
+                        print(f"  retry-delete error: {msg[:120]}")
+        time.sleep(60)
+    print(f"  WARNING: app '{app_name}' still present after {timeout_seconds}s; "
+          f"continue manually with `databricks apps delete {app_name}`")
+
+
 def telegram_get_me(token: str) -> dict | None:
     """Call Telegram getMe and return {'username': ..., 'first_name': ...} on success."""
     try:
@@ -1045,6 +1089,9 @@ def run_uninstall() -> None:
     except RuntimeError as exc:
         print(f"  bundle destroy reported a failure: {exc}")
         print("  (some resources may have already been removed; continuing)")
+
+    print("\n[2b] Confirming app deletion")
+    _wait_for_app_gone(w, app_name)
 
     if delete_lakebase:
         print(f"\n[3a] Deleting Lakebase instance '{lakebase}'")
