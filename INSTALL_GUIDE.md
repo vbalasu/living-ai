@@ -143,8 +143,10 @@ The installer then:
 
 1. Writes a Databricks CLI profile to `~/.databrickscfg`
 2. Stores the Telegram bot token + your username in Databricks Secrets
-3. Runs `databricks bundle deploy` to provision the App, Lakebase database,
-   schema, and UC volumes
+3. Runs `databricks bundle deploy` to provision the **Lakebase Postgres
+   instance, App, schema, and UC volumes** in one shot — all defined as
+   Databricks Asset Bundle resources, so a single `bundle destroy` later
+   tears them all down
 4. Runs `databricks bundle run living_ai_app` to start the App compute and
    push the source code
 5. Runs the Lakebase setup job to create conversation memory tables
@@ -289,7 +291,8 @@ The uninstaller reads `~/.living-ai/config.json` and walks you through:
 | Action                                       | Prompt / default                                         |
 | -------------------------------------------- | -------------------------------------------------------- |
 | Delete the Telegram webhook                  | `Y/n` (default Y)                                        |
-| Run `databricks bundle destroy`              | required (after typing the confirmation phrase)          |
+| Run `databricks bundle destroy`              | required (after typing the confirmation phrase) — removes App, schema, volumes, Lakebase, jobs |
+| Sweep for orphaned Lakebase instances        | `Y/n` (default Y) — covers legacy installs where Lakebase wasn't bundle-managed |
 | Delete the entire secrets scope              | `y/N` (default N — preserves other apps' secrets)        |
 | Delete just the agent's keys in that scope   | `Y/n` if you said no above                               |
 | Remove the CLI profile from `~/.databrickscfg` | `y/N` (default N)                                      |

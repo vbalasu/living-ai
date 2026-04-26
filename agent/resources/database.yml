@@ -1,0 +1,5 @@
+resources:
+  database_instances:
+    living_ai_db:
+      name: ${var.lakebase_instance}
+      capacity: CU_1

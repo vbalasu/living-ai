@@ -166,15 +166,35 @@ def load_saved_config() -> dict:
     if not CONFIG_FILE.exists():
         return {}
     try:
-        return json.loads(CONFIG_FILE.read_text())
+        cfg = json.loads(CONFIG_FILE.read_text())
     except Exception:
         return {}
+    # Fill in any keys missing from older config snapshots so callers can
+    # `cfg["x"]` without KeyErrors. Values come from current defaults.
+    defaults = {
+        "profile": "living-ai",
+        "agent_name": "April",
+        "app_name": "living-ai",
+        "catalog": "workspace",
+        "schema": "living_ai",
+        "secrets_scope": "living_ai",
+        "lakebase_instance": "april-db",
+        "llm_endpoint": DEFAULT_LLM_ENDPOINT,
+        "heartbeat_seconds": 120,
+        "daily_token_cap": 100000,
+    }
+    for k, v in defaults.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+_SECRET_KEYS = {"pat", "bot_token", "telegram_bot_token", "openai_api_key", "webhook_secret"}
 
 
 def save_config(snapshot: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    redacted = {k: v for k, v in snapshot.items() if "token" not in k and "key" not in k}
-    CONFIG_FILE.write_text(json.dumps(redacted, indent=2))
+    safe = {k: v for k, v in snapshot.items() if k not in _SECRET_KEYS}
+    CONFIG_FILE.write_text(json.dumps(safe, indent=2))
     try:
         CONFIG_FILE.chmod(0o600)
     except Exception:
@@ -826,7 +846,7 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
         return
 
     # ===== Apply =====
-    total = 7
+    total = 6
 
     _section(f"[1/{total}] Configure Databricks CLI profile")
     if reuse_creds:
@@ -844,10 +864,7 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
         secret_kvs["telegram_bot_token"] = bot_token
     ensure_secrets(w, secrets_scope, secret_kvs)
 
-    _section(f"[3/{total}] Provision Lakebase Postgres instance")
-    ensure_lakebase_instance(w, lakebase_name)
-
-    _section(f"[4/{total}] Prepare deployment bundle")
+    _section(f"[3/{total}] Prepare deployment bundle")
     bundle_dir = Path(tempfile.mkdtemp(prefix="living-ai-bundle-"))
     extract_bundle(bundle_dir)
     substitute_bundle_profile(bundle_dir, profile)
@@ -856,15 +873,16 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
 
     var_args = bundle_var_args(snapshot)
 
-    _section(f"[5/{total}] Provision Databricks resources (App, schema, volumes)")
+    _section(f"[4/{total}] Provision resources (Lakebase, App, schema, volumes)")
+    print("  this can take ~3-5 minutes the first time (Lakebase comes up)")
     run_databricks(cli, ["bundle", "deploy", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    _section(f"[6/{total}] Start the app and deploy the code")
+    _section(f"[5/{total}] Start the app and deploy the code")
     run_databricks(cli, ["bundle", "run", "living_ai_app", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    _section(f"[7/{total}] Initialize the conversation memory tables")
+    _section(f"[6/{total}] Initialize the conversation memory tables")
     run_databricks(cli, ["bundle", "run", "setup_tables", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
