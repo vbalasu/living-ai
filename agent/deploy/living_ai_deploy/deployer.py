@@ -327,15 +327,30 @@ def delete_telegram_webhook(token: str) -> bool:
         return False
 
 
+def telegram_get_me(token: str) -> dict | None:
+    """Call Telegram getMe and return {'username': ..., 'first_name': ...} on success."""
+    try:
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/getMe")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+            if body.get("ok"):
+                return body.get("result") or {}
+    except Exception:
+        return None
+    return None
+
+
 # --- CLI parsing ---
 
 def parse_args(argv: list[str]) -> dict:
-    args = {"reset": False, "print_config": False, "command": "deploy"}
+    args = {"reset": False, "print_config": False, "advanced": False, "command": "deploy"}
     for a in argv[1:]:
         if a in ("--reset", "-r"):
             args["reset"] = True
         elif a == "--print-config":
             args["print_config"] = True
+        elif a in ("--advanced", "-a"):
+            args["advanced"] = True
         elif a in ("uninstall", "destroy"):
             args["command"] = "uninstall"
         elif a in ("configure", "deploy", "reconfigure"):
@@ -363,127 +378,215 @@ def main() -> None:
         run_uninstall()
         return
 
-    run_deploy(reset=args["reset"])
+    run_deploy(reset=args["reset"], advanced=args["advanced"])
 
 
 # --- deploy flow ---
 
-def run_deploy(reset: bool) -> None:
-    saved = {} if reset else load_saved_config()
+def _hr() -> None:
+    print("─" * 72)
 
-    print("Living-AI agent deployer")
-    print("========================")
-    if saved:
-        print(f"\nFound saved config at {CONFIG_FILE}.")
-        print("Press ENTER at each prompt to keep the current value.\n")
-    else:
-        print("\nProvisions the agent into a Databricks workspace using the existing")
-        print("Databricks CLI + Asset Bundle packaged inside this binary.")
-        print("Free Edition is supported (uses FMAPI OSS endpoints by default).\n")
 
-    cli, tf = check_prereqs()
-    print(f"  databricks CLI:  {cli}")
-    print(f"  terraform:       {tf or '(none — bundle deploy may need it)'}")
+def _section(title: str) -> None:
+    print()
+    _hr()
+    print(f"  {title}")
+    _hr()
+
+
+def _explain(*lines: str) -> None:
+    for line in lines:
+        print(f"  {line}")
     print()
 
-    # --- Workspace ---
-    profile = prompts.ask(
-        "CLI profile name",
-        default=saved.get("profile", "living-ai"),
+
+def run_deploy(reset: bool, advanced: bool = False) -> None:
+    saved = {} if reset else load_saved_config()
+
+    print()
+    print("  ┌─────────────────────────────────────────────────────────────────┐")
+    print("  │  Living-AI agent installer                                      │")
+    print("  └─────────────────────────────────────────────────────────────────┘")
+    print()
+    print("  This installer will set up an autonomous AI agent that lives in")
+    print("  your Databricks workspace and chats with you on Telegram.")
+    print()
+    if saved:
+        print(f"  Found saved config at {CONFIG_FILE}.")
+        print("  Press ENTER at any prompt to keep the existing value.")
+    else:
+        print("  We'll ask three short rounds of questions:")
+        print("    1. Databricks workspace  (where the agent runs)")
+        print("    2. Telegram bot          (how you talk to it)")
+        print("    3. Agent personality     (what to call it)")
+        if not advanced:
+            print()
+            print("  Sensible defaults are used for everything else. To see and edit")
+            print("  every setting, re-run with --advanced.")
+
+    cli, tf = check_prereqs()
+    print()
+    print(f"  found: databricks CLI ({cli})")
+    print(f"  found: terraform     ({tf or 'NOT FOUND — bundle deploy may need it'})")
+
+    # ===== Block 1: Databricks workspace =====
+    _section("1. Databricks workspace")
+    _explain(
+        "The agent runs as a Databricks App. Free Edition works fine — no",
+        "credit card needed. We need two things:",
+        "",
+        "  • Your workspace URL (looks like https://dbc-xxxx.cloud.databricks.com)",
+        "  • A Personal Access Token so the installer can deploy on your behalf",
+        "",
+        "  Don't have a token? Make one in 30 seconds:",
+        "    1. Open your workspace URL in a browser",
+        "    2. Top-right avatar → Settings → Developer → Access tokens → Generate",
+        "    3. Copy the token (starts with 'dapi...')",
     )
+
+    profile_default = saved.get("profile", "living-ai")
+    if advanced:
+        profile = prompts.ask("CLI profile name to write", default=profile_default)
+    else:
+        profile = profile_default
+
     existing_host = existing_profile(profile)
     reuse_creds = False
     if existing_host:
-        print(f"  found existing CLI profile '{profile}' (host {existing_host})")
-        reuse_creds = prompts.ask_yn("  reuse existing credentials?", default=True)
+        print(f"  Found existing Databricks CLI profile '{profile}' for {existing_host}")
+        reuse_creds = prompts.ask_yn(
+            "  Use those credentials? (no = enter new ones)", default=True
+        )
 
     if reuse_creds:
         host = existing_host
         pat = ""
     else:
         host = prompts.ask(
-            "Workspace host (https://...)",
+            "Workspace URL (https://...)",
             default=saved.get("host", existing_host),
             validate=prompts.validate_host,
         )
-        pat = prompts.ask(
-            "Personal access token (PAT)",
-            secret=True,
-            validate=prompts.validate_pat,
-        )
+        while True:
+            pat = prompts.ask(
+                "Personal access token (input is hidden)",
+                secret=True,
+                validate=prompts.validate_pat,
+            )
+            print("  validating token against the workspace...")
+            err = _validate_pat_live(host, pat)
+            if err is None:
+                break
+            print(f"  ✗ {err}")
+            if not prompts.ask_yn("  retry with a different token?", default=True):
+                print("Aborted.", file=sys.stderr)
+                sys.exit(1)
 
-    # --- Agent identity ---
-    agent_name = prompts.ask("Agent name", default=saved.get("agent_name", "April"))
-    app_name = prompts.ask(
-        "Databricks App name",
-        default=saved.get("app_name", "living-ai"),
-        validate=prompts.validate_app_name,
+    # ===== Block 2: Telegram bot =====
+    _section("2. Telegram bot")
+    _explain(
+        "You'll DM the agent on Telegram. We need:",
+        "",
+        "  • A bot token from @BotFather  (takes 30 seconds, see below)",
+        "  • Your Telegram username       (the agent only replies to you)",
+        "",
+        "  How to make a bot:",
+        "    1. Open Telegram and DM @BotFather",
+        "    2. Send /newbot, pick a display name, then a unique username",
+        "       ending in 'bot' (e.g. agent_april_bot)",
+        "    3. Copy the token BotFather replies with (numbers:letters format)",
     )
-    catalog = prompts.ask(
-        "Catalog",
-        default=saved.get("catalog", "workspace"),
-        validate=prompts.validate_identifier,
-    )
-    schema = prompts.ask(
-        "Schema",
-        default=saved.get("schema", "living_ai"),
-        validate=prompts.validate_identifier,
-    )
-    secrets_scope = prompts.ask(
-        "Secrets scope name",
-        default=saved.get("secrets_scope", "living_ai"),
-        validate=prompts.validate_identifier,
-    )
-    lakebase_name = prompts.ask(
-        "Lakebase instance name",
-        default=saved.get("lakebase_instance", f"{app_name}-db"),
-        validate=prompts.validate_app_name,
-    )
-
-    # --- LLM serving endpoint ---
-    print()
-    print("  ┌─ LLM serving endpoint ─────────────────────────────────────────────")
-    print("  │ The agent calls a Databricks serving endpoint to think.")
-    print("  │")
-    print(f"  │ Default: {DEFAULT_LLM_ENDPOINT}")
-    print("  │   (FMAPI OSS — works on Free Edition with no extra setup)")
-    print("  │")
-    print("  │ Other FMAPI endpoints in your workspace also work, e.g.")
-    print("  │   databricks-meta-llama-3-1-8b-instruct, databricks-gpt-5-5, ...")
-    print("  │")
-    print("  │ To use OpenAI / Anthropic / Bedrock with your own provider key,")
-    print("  │ create an *external model* serving endpoint first, then enter")
-    print("  │ that endpoint's name here. Setup instructions:")
-    print(f"  │   {EXTERNAL_MODELS_DOCS}")
-    print("  └────────────────────────────────────────────────────────────────────")
-    llm_endpoint = prompts.ask(
-        "Serving endpoint name",
-        default=saved.get("llm_endpoint", DEFAULT_LLM_ENDPOINT),
-    )
-
-    heartbeat = int(prompts.ask("Heartbeat seconds", default=str(saved.get("heartbeat_seconds", 120))))
-    token_cap = int(prompts.ask("Daily LLM token cap", default=str(saved.get("daily_token_cap", 100000))))
-
-    # --- Telegram channel ---
-    print()
-    print("  Telegram is the primary channel. Create a bot via @BotFather to get a token.")
 
     bot_token = ""
-    skip_telegram = False
+    skip_telegram_secrets = False
     if saved:
-        skip_telegram = not prompts.ask_yn(
-            "Update Telegram bot token / handle?", default=False
+        skip_telegram_secrets = not prompts.ask_yn(
+            "Rotate Telegram bot token? (no = keep existing)", default=False
         )
-    if not skip_telegram:
-        bot_token = prompts.ask(
-            "Telegram bot token (from @BotFather)",
-            secret=True,
-            validate=prompts.validate_telegram_token,
-        )
+    if not skip_telegram_secrets:
+        while True:
+            bot_token = prompts.ask(
+                "Telegram bot token from @BotFather",
+                secret=True,
+                validate=prompts.validate_telegram_token,
+            )
+            bot_info = telegram_get_me(bot_token)
+            if bot_info and bot_info.get("username"):
+                print(f"  ✓ verified bot @{bot_info['username']} ({bot_info.get('first_name','')})")
+                break
+            print("  ✗ couldn't reach Telegram with that token; double-check and retry")
+            if not prompts.ask_yn("  retry?", default=True):
+                print("Aborted.", file=sys.stderr)
+                sys.exit(1)
+
     user_handle = prompts.ask(
-        "Primary Telegram user handle (without @)",
+        "Your Telegram username (without the @)",
         default=saved.get("telegram_user_handle"),
     ).lstrip("@")
+
+    # ===== Block 3: Agent personality =====
+    _section("3. Agent personality")
+    _explain(
+        "What should we call your agent? It will introduce itself with this",
+        "name. You can rename it later by re-running the installer.",
+    )
+    agent_name = prompts.ask("Agent name", default=saved.get("agent_name", "April"))
+
+    # ===== Advanced (hidden by default) =====
+    if advanced:
+        _section("4. Advanced settings")
+        _explain("Override Databricks resource names, LLM endpoint, heartbeat, token cap.")
+        app_name = prompts.ask(
+            "Databricks App name",
+            default=saved.get("app_name", "living-ai"),
+            validate=prompts.validate_app_name,
+        )
+        catalog = prompts.ask(
+            "Unity Catalog catalog",
+            default=saved.get("catalog", "workspace"),
+            validate=prompts.validate_identifier,
+        )
+        schema = prompts.ask(
+            "Schema",
+            default=saved.get("schema", "living_ai"),
+            validate=prompts.validate_identifier,
+        )
+        secrets_scope = prompts.ask(
+            "Secrets scope name",
+            default=saved.get("secrets_scope", "living_ai"),
+            validate=prompts.validate_identifier,
+        )
+        lakebase_name = prompts.ask(
+            "Lakebase instance name",
+            default=saved.get("lakebase_instance", f"{_safe_app_name(agent_name)}-db"),
+            validate=prompts.validate_app_name,
+        )
+        print()
+        print("  LLM endpoint:")
+        print(f"    Default: {DEFAULT_LLM_ENDPOINT}  (FMAPI OSS, works on Free Edition)")
+        print("    Other FMAPI endpoints work too. For OpenAI / Anthropic / Bedrock,")
+        print(f"    create an external model first: {EXTERNAL_MODELS_DOCS}")
+        llm_endpoint = prompts.ask(
+            "LLM serving endpoint name",
+            default=saved.get("llm_endpoint", DEFAULT_LLM_ENDPOINT),
+        )
+        heartbeat = int(prompts.ask(
+            "Heartbeat seconds (idle reflection cadence)",
+            default=str(saved.get("heartbeat_seconds", 120)),
+        ))
+        token_cap = int(prompts.ask(
+            "Daily LLM token cap",
+            default=str(saved.get("daily_token_cap", 100000)),
+        ))
+    else:
+        app_name = saved.get("app_name", "living-ai")
+        catalog = saved.get("catalog", "workspace")
+        schema = saved.get("schema", "living_ai")
+        secrets_scope = saved.get("secrets_scope", "living_ai")
+        lakebase_name = saved.get("lakebase_instance", f"{_safe_app_name(agent_name)}-db")
+        llm_endpoint = saved.get("llm_endpoint", DEFAULT_LLM_ENDPOINT)
+        heartbeat = int(saved.get("heartbeat_seconds", 120))
+        token_cap = int(saved.get("daily_token_cap", 100000))
 
     snapshot = {
         "host": host,
@@ -500,26 +603,32 @@ def run_deploy(reset: bool) -> None:
         "telegram_user_handle": user_handle,
     }
 
-    print("\n--- Plan ---")
-    print(f"  host:           {host}")
-    print(f"  profile:        {profile}")
-    print(f"  agent / app:    {agent_name} / {app_name}")
-    print(f"  catalog/schema: {catalog}.{schema}")
-    print(f"  secrets scope:  {secrets_scope}")
-    print(f"  lakebase:       {lakebase_name}")
-    print(f"  llm endpoint:   {llm_endpoint}")
-    print(f"  heartbeat:      {heartbeat}s   token cap: {token_cap}/day")
-    print(f"  primary user:   @{user_handle}")
+    # ===== Plan summary =====
+    _section("Summary — about to apply this configuration")
+    print(f"  Workspace:        {host}")
+    print(f"  Agent name:       {agent_name}")
+    print(f"  Telegram user:    @{user_handle}")
+    print(f"  LLM endpoint:     {llm_endpoint}")
+    if advanced:
+        print(f"  Databricks App:   {app_name}")
+        print(f"  Catalog/schema:   {catalog}.{schema}")
+        print(f"  Lakebase:         {lakebase_name}")
+        print(f"  Heartbeat:        every {heartbeat}s   token cap: {token_cap:,}/day")
+    else:
+        print(f"  Resources:        app={app_name}, lakebase={lakebase_name}, schema={catalog}.{schema}")
+        print(f"                    (re-run with --advanced to edit these)")
+    print()
 
-    if not prompts.ask_yn("\nProceed?", default=True):
+    if not prompts.ask_yn("Proceed with installation?", default=True):
         print("Aborted.")
         return
 
+    # ===== Apply =====
     total = 6
 
-    print(f"\n[1/{total}] Configure CLI profile")
+    _section(f"[1/{total}] Configure Databricks CLI profile")
     if reuse_creds:
-        print(f"  reusing existing profile '{profile}' from ~/.databrickscfg")
+        print(f"  reusing existing profile '{profile}'")
     else:
         configure_profile(host, pat, profile)
         print(f"  wrote profile '{profile}' to ~/.databrickscfg")
@@ -527,64 +636,103 @@ def run_deploy(reset: bool) -> None:
     os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
     w = WorkspaceClient(profile=profile)
 
-    print(f"\n[2/{total}] Set Databricks Secrets")
+    _section(f"[2/{total}] Store secrets in Databricks Secrets")
     secret_kvs: dict[str, str] = {}
-    if not skip_telegram:
+    if not skip_telegram_secrets:
         secret_kvs.update({
             "telegram_bot_token": bot_token,
             "telegram_primary_user_handle": user_handle,
         })
     if not secret_kvs:
-        print("  no secrets to update")
+        print("  no secrets to update (kept existing)")
     else:
         ensure_secrets(w, secrets_scope, secret_kvs)
 
-    print(f"\n[3/{total}] Extract bundle and substitute config")
+    _section(f"[3/{total}] Prepare deployment bundle")
     bundle_dir = Path(tempfile.mkdtemp(prefix="living-ai-bundle-"))
     extract_bundle(bundle_dir)
     substitute_app_yaml(bundle_dir, snapshot)
-    print(f"  bundle ready at {bundle_dir}")
+    print(f"  bundle ready")
 
     var_args = bundle_var_args(snapshot)
 
-    print(f"\n[4/{total}] Bundle deploy")
+    _section(f"[4/{total}] Provision Databricks resources (App, Lakebase, schema)")
     run_databricks(cli, ["bundle", "deploy", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    print(f"\n[5/{total}] Start app + deploy code")
+    _section(f"[5/{total}] Start the app and deploy the code")
     run_databricks(cli, ["bundle", "run", "living_ai_app", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    print(f"\n[6/{total}] Run Lakebase setup job")
+    _section(f"[6/{total}] Initialize the conversation memory tables")
     run_databricks(cli, ["bundle", "run", "setup_tables", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
     save_config(snapshot)
-    print(f"\n  saved config snapshot to {CONFIG_FILE}")
+
+    # Resolve the bot username for a clickable t.me link.
+    bot_username = ""
+    token_for_telegram = bot_token
+    if not token_for_telegram:
+        try:
+            token_for_telegram = read_secret(w, secrets_scope, "telegram_bot_token") or ""
+        except Exception:
+            token_for_telegram = ""
+    if token_for_telegram:
+        info = telegram_get_me(token_for_telegram)
+        if info:
+            bot_username = info.get("username") or ""
+        # Clear any registered webhook so long-polling can take over.
+        delete_telegram_webhook(token_for_telegram)
 
     app = w.apps.get(app_name)
     app_url = app.url
-    print(f"\nApp URL: {app_url}")
 
-    if bot_token:
-        print("\n[+] Clearing any registered Telegram webhook (long-polling mode)")
-        delete_telegram_webhook(bot_token)
-    elif not skip_telegram:
-        # User updated handle but not token — try to read existing token from secrets to clear webhook
-        try:
-            existing_token = read_secret(w, secrets_scope, "telegram_bot_token")
-            if existing_token:
-                print("\n[+] Clearing any registered Telegram webhook (long-polling mode)")
-                delete_telegram_webhook(existing_token)
-        except Exception:
-            pass
+    # ===== Final summary =====
+    print()
+    print("  ┌─────────────────────────────────────────────────────────────────┐")
+    print("  │  Your agent is live.                                            │")
+    print("  └─────────────────────────────────────────────────────────────────┘")
+    print()
+    print(f"   Agent:           {agent_name}")
+    print(f"   App URL:         {app_url}")
+    print(f"   LLM:             {llm_endpoint} (no extra LLM costs on Free Edition)")
+    print(f"   Memory:          last 60 exchanges remembered, persisted in Lakebase ({lakebase_name})")
+    print(f"   Heartbeat:       every {heartbeat}s; idle reflection at most every 30 min")
+    print()
+    print(f"   ▶ Start chatting on Telegram:")
+    if bot_username:
+        print(f"       https://t.me/{bot_username}")
+        print(f"     Open that link, hit START, and DM the agent. {agent_name} replies in seconds.")
+    else:
+        print(f"     Open Telegram and DM your bot. {agent_name} replies in seconds.")
+    print()
+    print(f"   Manage:")
+    print(f"     reconfigure   →  ./living-ai-deploy.pex configure")
+    print(f"     advanced      →  ./living-ai-deploy.pex --advanced")
+    print(f"     uninstall     →  ./living-ai-deploy.pex uninstall")
+    print(f"     show config   →  ./living-ai-deploy.pex --print-config")
+    print()
+    print(f"   Saved to: {CONFIG_FILE} (no secrets — those are in Databricks)")
+    print()
 
-    print("\nDeployment complete.")
-    print(f"   DM your bot to greet {agent_name}.")
-    print(f"   Tail logs:    databricks --profile {profile} apps logs {app_name}")
-    print(f"   Reconfigure:  ./living-ai-deploy.pex configure")
-    print(f"   Uninstall:    ./living-ai-deploy.pex uninstall")
-    print(f"   App page:     {app_url}")
+
+def _safe_app_name(name: str) -> str:
+    """Coerce an arbitrary agent name into a valid Lakebase / app name."""
+    out = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+    return out or "living-ai"
+
+
+def _validate_pat_live(host: str, pat: str) -> str | None:
+    """Return None if the PAT works, or an error string."""
+    try:
+        w = WorkspaceClient(host=host, token=pat)
+        me = w.current_user.me()
+        user = getattr(me, "user_name", None) or getattr(me, "display_name", "?")
+        print(f"  ✓ token valid; signed in as {user}")
+        return None
+    except Exception as exc:
+        return f"token check failed: {exc}"
 
 
 # --- uninstall flow ---

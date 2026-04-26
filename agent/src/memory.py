@@ -132,6 +132,89 @@ class Memory:
                 log.exception("event persist to lakebase failed; buffered in memory")
         return ev
 
+    def conversation_history(self, thread_id: str, limit_pairs: int = 30,
+                             char_budget: int = 12_000) -> list[dict]:
+        """Return chat-completions style messages for a single thread, oldest first.
+
+        Pulls the most recent `stimulus` + `response` events scoped to thread_id from
+        Lakebase, drops any half-failed turn (a stimulus followed by an error within
+        5s and no response), trims to `limit_pairs` user/assistant pairs and an
+        approximate `char_budget`, and returns a list of
+        {"role": "user"|"assistant", "content": "..."} dicts ready to splice into
+        the LLM messages list.
+        """
+        if self._lakebase is None or not thread_id:
+            return []
+
+        try:
+            with self._lakebase.cursor() as cur:
+                cur.execute(
+                    "SELECT id, ts, kind, payload "
+                    "FROM events "
+                    "WHERE thread_id = %s AND kind IN ('stimulus','response','error') "
+                    "ORDER BY ts DESC LIMIT %s",
+                    (thread_id, limit_pairs * 4),
+                )
+                rows = cur.fetchall()
+        except Exception:
+            log.exception("conversation_history lakebase read failed")
+            return []
+
+        # rows are newest-first; reverse to oldest-first for processing
+        events = [
+            {"id": str(r[0]), "ts": r[1], "kind": r[2], "payload": r[3] or {}}
+            for r in reversed(rows)
+        ]
+
+        # drop a stimulus that has no matching response and an adjacent error
+        cleaned: list[dict] = []
+        i = 0
+        while i < len(events):
+            e = events[i]
+            if e["kind"] == "stimulus":
+                # look ahead: if the next event is an error within 5s, skip both
+                if i + 1 < len(events):
+                    nxt = events[i + 1]
+                    if nxt["kind"] == "error":
+                        try:
+                            t1 = e["ts"].timestamp() if hasattr(e["ts"], "timestamp") else 0
+                            t2 = nxt["ts"].timestamp() if hasattr(nxt["ts"], "timestamp") else 0
+                            if abs(t2 - t1) < 5:
+                                i += 2
+                                continue
+                        except Exception:
+                            pass
+                cleaned.append(e)
+            elif e["kind"] == "response":
+                cleaned.append(e)
+            i += 1
+
+        # build user/assistant pairs newest-last; cap by limit_pairs and char_budget
+        msgs: list[dict] = []
+        for e in cleaned:
+            if e["kind"] == "stimulus":
+                text = (e["payload"] or {}).get("text", "")
+                if text:
+                    msgs.append({"role": "user", "content": text})
+            elif e["kind"] == "response":
+                text = (e["payload"] or {}).get("text", "")
+                if text:
+                    msgs.append({"role": "assistant", "content": text})
+
+        # keep only the tail that fits in budget
+        max_msgs = limit_pairs * 2
+        msgs = msgs[-max_msgs:]
+        total = sum(len(m["content"]) for m in msgs)
+        while msgs and total > char_budget:
+            dropped = msgs.pop(0)
+            total -= len(dropped["content"])
+
+        # ensure we don't start with an assistant turn (LLMs prefer user-first history)
+        while msgs and msgs[0]["role"] != "user":
+            msgs.pop(0)
+
+        return msgs
+
     def recent_events(self, limit: int = 30) -> list[dict]:
         with self._lock:
             buffered = list(self._buffer)

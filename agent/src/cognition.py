@@ -8,7 +8,6 @@ a matter of changing the LLM_ENDPOINT env var.
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -35,8 +34,10 @@ These are facts you have learned over time.
 
 {learnings}
 
-Recent events (most recent first):
-{recent_events}
+The messages that follow this system prompt are the live, continuing conversation
+with the user. Treat them as one ongoing exchange — do not introduce yourself
+again, do not greet the user as if it's a fresh session, and do not repeat
+earlier turns. Pick up from the most recent message.
 
 Behavior:
 - Respond as {agent_name}, in the user's primary channel.
@@ -45,6 +46,12 @@ Behavior:
 - Keep responses tight unless detail is requested.
 - Current UTC time: {now}
 """
+
+
+# How many user/assistant pairs of history to thread into the messages list.
+HISTORY_PAIRS = 30  # = up to 60 messages of conversation context
+# Approximate char budget for the threaded history (≈ 3K tokens).
+HISTORY_CHAR_BUDGET = 12_000
 
 
 class Cognition:
@@ -60,28 +67,25 @@ class Cognition:
         return self._client
 
     def build_system_prompt(self) -> str:
-        recent = self.memory.recent_events(limit=20)
-        recent_str = (
-            "\n".join(
-                f"- [{e['ts']}] {e['kind']}"
-                + (f" ({e['channel']})" if e.get("channel") else "")
-                + (f": {json.dumps(e.get('payload', {}))[:200]}" if e.get("payload") else "")
-                for e in recent
-            )
-            or "(none yet — fresh start)"
-        )
         return SYSTEM_PROMPT_TEMPLATE.format(
             agent_name=self.cfg.agent_name,
             identity=self.memory.identity(),
             goals=self.memory.goals(),
             learnings=self.memory.learnings(),
-            recent_events=recent_str,
             now=datetime.now(timezone.utc).isoformat(),
         )
 
     def respond(self, user_message: str, channel: str = "telegram",
                 thread_id: str | None = None) -> dict[str, Any]:
         system_prompt = self.build_system_prompt()
+
+        history: list[dict] = []
+        if thread_id:
+            history = self.memory.conversation_history(
+                thread_id,
+                limit_pairs=HISTORY_PAIRS,
+                char_budget=HISTORY_CHAR_BUDGET,
+            )
 
         self.memory.append_event(
             kind="stimulus",
@@ -90,13 +94,14 @@ class Cognition:
             payload={"text": user_message},
         )
 
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
         try:
             resp = self.client().chat.completions.create(
                 model=self.cfg.llm_endpoint,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
+                messages=messages,
                 max_tokens=1024,
             )
             text = resp.choices[0].message.content or ""
@@ -110,6 +115,7 @@ class Cognition:
             self.memory.append_event(
                 kind="error",
                 channel=channel,
+                thread_id=thread_id,
                 payload={"error": str(exc), "stage": "llm_call"},
             )
             return {"text": f"({self.cfg.agent_name} hit an error and is recovering.)", "error": str(exc)}
