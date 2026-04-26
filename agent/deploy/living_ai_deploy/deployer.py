@@ -375,17 +375,54 @@ def delete_secret_scope(w: WorkspaceClient, scope: str) -> None:
 
 # --- bundle deploy via CLI ---
 
+_TRANSIENT_PATTERNS = (
+    "unexpected EOF",
+    "connection reset by peer",
+    "i/o timeout",
+    "EOF",
+    "context deadline exceeded",
+    "503 Service Unavailable",
+    "502 Bad Gateway",
+    "504 Gateway Timeout",
+)
+
+
 def run_databricks(cli: str, args: list[str], profile: str,
                    tf_exec_path: str | None = None,
-                   cwd: Path | None = None) -> None:
+                   cwd: Path | None = None,
+                   max_transient_retries: int = 3) -> None:
+    """Run a `databricks ...` command, retrying transient network errors.
+
+    `bundle deploy`/`bundle run` occasionally hit `unexpected EOF` or 5xx from
+    the Databricks API while polling app/job state. The command is idempotent
+    enough to retry — bundle deploy is a no-op if everything's already in
+    place, and `bundle run` for an app/job is a fresh trigger.
+    """
     env = os.environ.copy()
     if tf_exec_path:
         env["DATABRICKS_TF_EXEC_PATH"] = tf_exec_path
         env["DATABRICKS_TF_VERSION"] = _terraform_version(tf_exec_path)
     cmd = [cli, "--profile", profile] + args
     print(f"  $ {' '.join(cmd)}")
-    res = subprocess.run(cmd, env=env, cwd=str(cwd) if cwd else None)
-    if res.returncode != 0:
+    attempt = 0
+    while True:
+        log_path = Path(tempfile.gettempdir()) / "living-ai-databricks.log"
+        with open(log_path, "wb") as f:
+            res = subprocess.run(cmd, env=env, cwd=str(cwd) if cwd else None,
+                                 stdout=f, stderr=subprocess.STDOUT)
+        log_text = log_path.read_text(errors="replace")
+        sys.stdout.write(log_text)
+        sys.stdout.flush()
+        if res.returncode == 0:
+            return
+        if attempt >= max_transient_retries:
+            raise RuntimeError(f"`databricks {' '.join(args)}` failed (exit {res.returncode})")
+        if any(p in log_text for p in _TRANSIENT_PATTERNS):
+            attempt += 1
+            print(f"  transient API error detected — retrying ({attempt}/{max_transient_retries}) in 15s …")
+            import time as _t
+            _t.sleep(15)
+            continue
         raise RuntimeError(f"`databricks {' '.join(args)}` failed (exit {res.returncode})")
 
 
@@ -490,6 +527,113 @@ def delete_telegram_webhook(token: str) -> bool:
     except Exception as exc:
         print(f"  telegram deleteWebhook failed: {exc}")
         return False
+
+
+def _next_lakebase_name(name: str) -> str:
+    """may-db -> may-db-2;  may-db-2 -> may-db-3;  …"""
+    m = re.match(r"^(.+?)(?:-(\d+))?$", name)
+    if not m:
+        return f"{name}-2"
+    base, n = m.group(1), m.group(2)
+    if n is None:
+        return f"{base}-2"
+    return f"{base}-{int(n) + 1}"
+
+
+def _deploy_with_app_retry(cli: str, *, profile: str, tf_exec_path: str | None,
+                           cwd: Path, w: WorkspaceClient, app_name: str,
+                           snapshot: dict, bundle_dir: Path, capture_log: Path,
+                           max_retries: int = 4) -> None:
+    """Run `databricks bundle deploy` with auto-recovery for two known transient issues:
+
+    1. "Instance name is not unique" — Databricks holds Lakebase instance names for
+       a ~7-day grace window after deletion. If a previous attempt's instance is still
+       in the soft-delete window, we mutate the lakebase var (`may-db` → `may-db-2`)
+       and retry.
+
+    2. "App creation failed unexpectedly" — Apps platform sometimes ERRORs on first
+       create. The platform's only fix is delete + retry. We do that automatically.
+
+    Other failure modes pass through unchanged.
+    """
+    attempt = 0
+    while True:
+        var_args = bundle_var_args(snapshot)
+        capture_log.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [cli, "--profile", profile, "bundle", "deploy", "-t", "free"] + var_args
+        env = os.environ.copy()
+        if tf_exec_path:
+            env["DATABRICKS_TF_EXEC_PATH"] = tf_exec_path
+            env["DATABRICKS_TF_VERSION"] = _terraform_version(tf_exec_path)
+        print(f"  $ {' '.join(cmd)}")
+        with open(capture_log, "wb") as f:
+            res = subprocess.run(cmd, env=env, cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT)
+        log_text = capture_log.read_text(errors="replace")
+        sys.stdout.write(log_text)
+        sys.stdout.flush()
+        if res.returncode == 0:
+            return
+
+        if attempt >= max_retries:
+            raise RuntimeError(f"`bundle deploy` failed after {attempt + 1} attempts (exit {res.returncode})")
+
+        # Lakebase name collision — increment suffix and retry.
+        if "Instance name is not unique" in log_text and "database_instance" in log_text:
+            old = snapshot["lakebase_instance"]
+            new = _next_lakebase_name(old)
+            print()
+            print(f"  Lakebase name '{old}' is reserved (recently deleted, ~7-day cooldown).")
+            print(f"  retrying with '{new}' instead.")
+            snapshot["lakebase_instance"] = new
+            # The lakebase name is also baked into src/app.yaml's LAKEBASE_INSTANCE
+            # env var by substitute_app_yaml. Re-substitute so the App reads the
+            # new name at runtime.
+            substitute_app_yaml(bundle_dir, snapshot)
+            attempt += 1
+            continue
+
+        # App went to ERROR — delete and retry.
+        state = _app_compute_state(w, app_name)
+        if state == "ERROR" or "App creation failed" in log_text:
+            attempt += 1
+            print()
+            print(f"  bundle deploy failed and app '{app_name}' is in ERROR state.")
+            print(f"  this is a known transient platform issue — clearing it and retrying "
+                  f"(attempt {attempt}/{max_retries}).")
+            _delete_app_and_wait(w, app_name)
+            print(f"  retrying bundle deploy …")
+            continue
+
+        # Unrecognized failure — surface to caller.
+        raise RuntimeError(f"`bundle deploy` failed (exit {res.returncode})")
+
+
+def _app_compute_state(w: WorkspaceClient, app_name: str) -> str | None:
+    """Return the App's compute_state (e.g. 'ERROR'), or None if the App doesn't exist."""
+    try:
+        app = w.apps.get(app_name)
+    except Exception:
+        return None
+    cs = getattr(getattr(app, "compute_status", None), "state", None)
+    if cs is None:
+        return ""
+    val = getattr(cs, "value", None) or str(cs)
+    return val.split(".")[-1].upper()
+
+
+def _delete_app_and_wait(w: WorkspaceClient, app_name: str,
+                         timeout_seconds: int = 1800) -> bool:
+    """Delete the named App and block until it's gone. Returns True if removed."""
+    print(f"  deleting app '{app_name}' …")
+    try:
+        w.apps.delete(app_name)
+    except Exception as exc:
+        msg = str(exc)
+        if "does not exist" in msg.lower() or "not found" in msg.lower():
+            return True
+        print(f"  initial delete returned: {msg[:160]}")
+    _wait_for_app_gone(w, app_name, timeout_seconds=timeout_seconds)
+    return _app_compute_state(w, app_name) is None
 
 
 def _wait_for_app_gone(w: WorkspaceClient, app_name: str,
@@ -919,8 +1063,25 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
 
     _section(f"[4/{total}] Provision resources (Lakebase, App, schema, volumes)")
     print("  this can take ~3-5 minutes the first time (Lakebase comes up)")
-    run_databricks(cli, ["bundle", "deploy", "-t", "free"] + var_args,
-                   profile=profile, tf_exec_path=tf, cwd=bundle_dir)
+
+    # If a previous attempt left the App in ERROR, the platform refuses to
+    # let bundle deploy "fix" it — we have to delete it first.
+    pre_state = _app_compute_state(w, app_name)
+    if pre_state == "ERROR":
+        print(f"  found existing app '{app_name}' in ERROR state — deleting before retry")
+        _delete_app_and_wait(w, app_name)
+
+    _deploy_with_app_retry(
+        cli,
+        profile=profile, tf_exec_path=tf, cwd=bundle_dir,
+        w=w, app_name=app_name,
+        snapshot=snapshot,
+        bundle_dir=bundle_dir,
+        capture_log=Path(tempfile.gettempdir()) / "living-ai-bundle-deploy.log",
+    )
+    # snapshot may have been mutated by the retry logic — refresh local var.
+    lakebase_name = snapshot["lakebase_instance"]
+    var_args = bundle_var_args(snapshot)
 
     _section(f"[5/{total}] Start the app and deploy the code")
     run_databricks(cli, ["bundle", "run", "living_ai_app", "-t", "free"] + var_args,
