@@ -27,7 +27,6 @@ import os
 import re
 import shutil
 import subprocess
-import secrets as secrets_lib
 import sys
 import tempfile
 import urllib.parse
@@ -306,30 +305,17 @@ def substitute_app_yaml(bundle_dir: Path, snapshot: dict) -> None:
     app_yaml.write_text(text)
 
 
-# --- Telegram webhook ---
-
-def configure_telegram_webhook(token: str, app_url: str, secret: str) -> bool:
-    data = urllib.parse.urlencode({
-        "url": f"{app_url}/telegram/webhook",
-        "secret_token": secret,
-    }).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/setWebhook", data=data,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode()
-            print(f"  telegram response: {body[:200]}")
-            return '"ok":true' in body
-    except Exception as exc:
-        print(f"  telegram webhook setup failed: {exc}")
-        return False
-
+# --- Telegram (long-polling mode) ---
+#
+# Databricks Apps don't accept anonymous inbound traffic, so the agent uses
+# Telegram long-polling instead of webhooks. The deployer only needs to make
+# sure no webhook is registered on the bot — Telegram refuses getUpdates if
+# a webhook is configured.
 
 def delete_telegram_webhook(token: str) -> bool:
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/deleteWebhook",
-        data=urllib.parse.urlencode({"drop_pending_updates": "true"}).encode(),
+        data=urllib.parse.urlencode({"drop_pending_updates": "false"}).encode(),
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -498,11 +484,6 @@ def run_deploy(reset: bool) -> None:
         "Primary Telegram user handle (without @)",
         default=saved.get("telegram_user_handle"),
     ).lstrip("@")
-    set_webhook = (not skip_telegram) and prompts.ask_yn(
-        "Set the Telegram webhook now?", default=True
-    )
-
-    webhook_secret = secrets_lib.token_hex(16)
 
     snapshot = {
         "host": host,
@@ -529,7 +510,6 @@ def run_deploy(reset: bool) -> None:
     print(f"  llm endpoint:   {llm_endpoint}")
     print(f"  heartbeat:      {heartbeat}s   token cap: {token_cap}/day")
     print(f"  primary user:   @{user_handle}")
-    print(f"  set webhook:    {set_webhook}")
 
     if not prompts.ask_yn("\nProceed?", default=True):
         print("Aborted.")
@@ -553,7 +533,6 @@ def run_deploy(reset: bool) -> None:
         secret_kvs.update({
             "telegram_bot_token": bot_token,
             "telegram_primary_user_handle": user_handle,
-            "telegram_webhook_secret": webhook_secret,
         })
     if not secret_kvs:
         print("  no secrets to update")
@@ -587,10 +566,18 @@ def run_deploy(reset: bool) -> None:
     app_url = app.url
     print(f"\nApp URL: {app_url}")
 
-    if set_webhook:
-        print("\n[+] Setting Telegram webhook")
-        if configure_telegram_webhook(bot_token, app_url, webhook_secret):
-            print("  webhook set")
+    if bot_token:
+        print("\n[+] Clearing any registered Telegram webhook (long-polling mode)")
+        delete_telegram_webhook(bot_token)
+    elif not skip_telegram:
+        # User updated handle but not token — try to read existing token from secrets to clear webhook
+        try:
+            existing_token = read_secret(w, secrets_scope, "telegram_bot_token")
+            if existing_token:
+                print("\n[+] Clearing any registered Telegram webhook (long-polling mode)")
+                delete_telegram_webhook(existing_token)
+        except Exception:
+            pass
 
     print("\nDeployment complete.")
     print(f"   DM your bot to greet {agent_name}.")

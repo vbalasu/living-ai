@@ -34,9 +34,3 @@ resources:
             scope: ${var.secrets_scope}
             key: telegram_primary_user_handle
             permission: READ
-        - name: telegram-webhook-secret
-          description: "Secret token for verifying Telegram webhooks"
-          secret:
-            scope: ${var.secrets_scope}
-            key: telegram_webhook_secret
-            permission: READ

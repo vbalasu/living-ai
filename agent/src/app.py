@@ -1,7 +1,11 @@
 """FastAPI entrypoint for the living AI agent (April).
 
-Runs as a Databricks App. UC Volumes mount automatically. FMAPI auth is via
-the App's service principal (Databricks SDK picks it up from env).
+Runs as a Databricks App. UC Volumes mount automatically. Serving-endpoint
+auth is via the App's service principal (Databricks SDK picks it up from env).
+
+Telegram I/O runs in long-polling mode in a background asyncio task. Inbound
+webhooks aren't viable on Databricks Apps because the workspace OAuth gate
+intercepts them, so the agent reaches out to api.telegram.org instead.
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ import config
 from cognition import Cognition
 from heartbeat import heartbeat_loop
 from memory import Memory
-from telegram import TelegramClient, make_router
+from telegram import TelegramClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,9 +40,15 @@ async def lifespan(app: FastAPI):
     app.state.cognition = cognition
     app.state.telegram = telegram
 
-    app.include_router(make_router(cognition, telegram), prefix="/telegram")
-
     last_chat_id: dict[str, int] = {}
+
+    async def on_telegram_message(chat_id: int, text: str):
+        last_chat_id["id"] = chat_id
+        thread_id = f"chat:{chat_id}"
+        result = await asyncio.to_thread(
+            cognition.respond, text, "telegram", thread_id
+        )
+        await telegram.send(chat_id, result["text"])
 
     async def on_proactive(text: str):
         if telegram is None or not last_chat_id.get("id"):
@@ -46,19 +56,27 @@ async def lifespan(app: FastAPI):
             return
         await telegram.send(last_chat_id["id"], text)
 
-    task = asyncio.create_task(heartbeat_loop(cfg, memory, cognition, on_proactive))
+    tasks: list[asyncio.Task] = [
+        asyncio.create_task(heartbeat_loop(cfg, memory, cognition, on_proactive)),
+    ]
+    if telegram is not None:
+        tasks.append(asyncio.create_task(telegram.poll_loop(on_telegram_message)))
 
-    log.info("agent %s online; tick=%ss; llm=%s; telegram=%s",
-             cfg.agent_name, cfg.heartbeat_seconds, cfg.llm_endpoint,
-             "configured" if telegram else "pending")
+    log.info(
+        "agent %s online; tick=%ss; llm=%s; telegram=%s",
+        cfg.agent_name, cfg.heartbeat_seconds, cfg.llm_endpoint,
+        "polling" if telegram else "pending",
+    )
 
     yield
 
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Living AI Agent", lifespan=lifespan)
@@ -71,7 +89,7 @@ async def root():
         "agent": cfg.agent_name,
         "llm_endpoint": cfg.llm_endpoint,
         "heartbeat_seconds": cfg.heartbeat_seconds,
-        "telegram": "configured" if app.state.telegram else "pending",
+        "telegram": "polling" if app.state.telegram else "pending",
     }
 
 

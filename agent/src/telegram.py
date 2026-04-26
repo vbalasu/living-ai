@@ -1,30 +1,31 @@
-"""Telegram channel adapter.
+"""Telegram channel adapter — long-polling mode.
 
-The bot token and primary user handle are loaded from Databricks Secrets at startup.
-Inbound webhooks are verified via the X-Telegram-Bot-Api-Secret-Token header.
+Databricks Apps can't be exposed publicly, so inbound webhooks from Telegram
+get bounced by the workspace OAuth gate. We sidestep that by *outbound*
+long-polling: the agent calls api.telegram.org/getUpdates and processes
+messages itself. Outbound HTTPS is unrestricted on Databricks Apps.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
-import os
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 from databricks.sdk import WorkspaceClient
-from fastapi import APIRouter, Header, HTTPException, Request
-
-from cognition import Cognition
 
 log = logging.getLogger(__name__)
 
 
+# Async callback: (chat_id, text) -> None
+OnMessage = Callable[[int, str], Awaitable[None]]
+
+
 class TelegramClient:
-    def __init__(self, token: str, primary_user_handle: str | None,
-                 webhook_secret: str | None = None):
+    def __init__(self, token: str, primary_user_handle: str | None):
         self.token = token
         self.primary_user_handle = (primary_user_handle or "").lstrip("@").lower()
-        self.webhook_secret = webhook_secret
         self.api = f"https://api.telegram.org/bot{token}"
 
     @classmethod
@@ -37,16 +38,9 @@ class TelegramClient:
                 handle = w.secrets.get_secret(scope=scope, key="telegram_primary_user_handle").value
             except Exception:
                 pass
-            secret = ""
-            try:
-                secret = w.secrets.get_secret(scope=scope, key="telegram_webhook_secret").value
-            except Exception:
-                pass
-            import base64
             return cls(
                 token=base64.b64decode(token).decode(),
                 primary_user_handle=base64.b64decode(handle).decode() if handle else None,
-                webhook_secret=base64.b64decode(secret).decode() if secret else None,
             )
         except Exception as exc:
             log.warning("Telegram secrets not configured yet: %s", exc)
@@ -61,45 +55,85 @@ class TelegramClient:
             if r.status_code >= 300:
                 log.warning("telegram send failed: %s %s", r.status_code, r.text)
 
+    async def delete_webhook(self) -> None:
+        """Telegram disallows getUpdates while a webhook is set. Make sure no webhook is configured."""
+        async with httpx.AsyncClient(timeout=15) as c:
+            try:
+                r = await c.post(
+                    f"{self.api}/deleteWebhook",
+                    json={"drop_pending_updates": False},
+                )
+                if r.status_code >= 300:
+                    log.warning("telegram deleteWebhook failed: %s %s", r.status_code, r.text)
+                else:
+                    log.info("telegram webhook cleared (long-polling mode)")
+            except Exception:
+                log.exception("telegram deleteWebhook errored; continuing")
 
-def make_router(cognition: Cognition, telegram: TelegramClient | None) -> APIRouter:
-    router = APIRouter()
+    async def poll_loop(self, on_message: OnMessage) -> None:
+        """Long-poll Telegram for new messages and dispatch to on_message.
 
-    @router.post("/webhook")
-    async def webhook(
-        request: Request,
-        x_telegram_bot_api_secret_token: str | None = Header(default=None),
-    ):
-        if telegram is None:
-            raise HTTPException(503, "Telegram not configured")
-        if telegram.webhook_secret and x_telegram_bot_api_secret_token != telegram.webhook_secret:
-            raise HTTPException(403, "bad webhook secret")
+        Runs forever. Cancellable via the asyncio task. Reconnects on transient
+        failures with exponential backoff capped at 60s.
+        """
+        await self.delete_webhook()
 
-        update = await request.json()
-        message = update.get("message") or update.get("edited_message")
-        if not message:
-            return {"ok": True, "ignored": "no message"}
+        offset: int | None = None
+        backoff = 1.0
+        long_poll_timeout = 25  # seconds
+        async with httpx.AsyncClient(timeout=long_poll_timeout + 10) as client:
+            while True:
+                try:
+                    params: dict[str, Any] = {
+                        "timeout": long_poll_timeout,
+                        "allowed_updates": '["message","edited_message"]',
+                    }
+                    if offset is not None:
+                        params["offset"] = offset
+                    r = await client.get(f"{self.api}/getUpdates", params=params)
+                    if r.status_code != 200:
+                        log.warning("getUpdates http %s: %s", r.status_code, r.text[:200])
+                        await asyncio.sleep(min(backoff, 60))
+                        backoff = min(backoff * 2, 60)
+                        continue
+                    body = r.json()
+                    if not body.get("ok"):
+                        log.warning("getUpdates not ok: %s", body)
+                        await asyncio.sleep(min(backoff, 60))
+                        backoff = min(backoff * 2, 60)
+                        continue
 
-        chat_id = message["chat"]["id"]
-        from_user = message.get("from", {}) or {}
+                    backoff = 1.0  # reset after a successful round-trip
+
+                    for update in body.get("result", []):
+                        offset = update["update_id"] + 1
+                        await self._dispatch_update(update, on_message)
+
+                except asyncio.CancelledError:
+                    log.info("telegram poll cancelled")
+                    raise
+                except Exception:
+                    log.exception("telegram poll iteration failed; backing off")
+                    await asyncio.sleep(min(backoff, 60))
+                    backoff = min(backoff * 2, 60)
+
+    async def _dispatch_update(self, update: dict, on_message: OnMessage) -> None:
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
+            return
+        chat_id = msg["chat"]["id"]
+        from_user = msg.get("from") or {}
         username = (from_user.get("username") or "").lower()
 
-        if telegram.primary_user_handle and username != telegram.primary_user_handle:
-            await telegram.send(
+        if self.primary_user_handle and username != self.primary_user_handle:
+            await self.send(
                 chat_id,
-                f"Sorry, I only respond to @{telegram.primary_user_handle}.",
+                f"Sorry, I only respond to @{self.primary_user_handle}.",
             )
-            return {"ok": True, "ignored": "not primary user"}
+            return
 
-        text = message.get("text") or ""
+        text = msg.get("text") or ""
         if not text:
-            return {"ok": True, "ignored": "no text"}
+            return
 
-        thread_id = f"chat:{chat_id}"
-        result = await asyncio.to_thread(
-            cognition.respond, text, "telegram", thread_id
-        )
-        await telegram.send(chat_id, result["text"])
-        return {"ok": True}
-
-    return router
+        await on_message(chat_id, text)

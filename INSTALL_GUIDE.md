@@ -283,32 +283,23 @@ rm -rf ~/.living-ai
 
 ---
 
-## 8. Known limitation: Telegram webhook + Databricks Apps auth
+## 8. How Telegram I/O actually works (long-polling, not webhooks)
 
-By default, Databricks Apps require workspace-level OAuth on every route.
-Telegram cannot follow OAuth redirects, so its `POST /telegram/webhook` calls
-get a `302 Found` and the bot never reaches the agent. You can confirm this
-by polling the bot's webhook info:
+Databricks Apps cannot be made public — the workspace OAuth gate fronts every
+route, and Telegram doesn't follow OAuth redirects. Inbound webhooks therefore
+never reach the agent. We sidestep this by running Telegram in **long-polling
+mode**: the App reaches *outbound* to `api.telegram.org/getUpdates`, which is
+unrestricted, and processes messages itself.
 
-```bash
-curl -sS "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo" | jq .
-# look for: "last_error_message": "Wrong response from the webhook: 302 Found"
-```
+Practical implications:
 
-The agent's **autonomous heartbeat / idle-reflection loop still runs** — that's
-all internal cognition, no inbound channel needed. Internal events show up in
-the Lakebase event log; the deployer's qwen3 endpoint validation step proves
-the cognition path works end-to-end.
-
-To unblock Telegram, either:
-- ask a workspace admin to enable unauthenticated app routes (workspace
-  setting; not configurable from the bundle), or
-- front the App with a public proxy (Cloud Run, Cloudflare Worker, etc.) that
-  forwards `/telegram/webhook` to the App after attaching a Databricks OAuth
-  token.
-
-This is a workspace-level constraint, not something the deployer or bundle
-can fix on its own.
+- The `set webhook now?` prompt is gone. The deployer no longer registers a
+  webhook URL with Telegram.
+- The agent's `poll_loop` calls `deleteWebhook` on startup before polling, so
+  flipping a bot from a previous webhook-mode deployment "just works."
+- A bot can have either a webhook **or** a polling consumer, never both. If
+  you point another tool at the same bot via `setWebhook`, the agent's polling
+  will start failing with `Conflict: terminated by other getUpdates request`.
 
 ---
 
@@ -321,8 +312,55 @@ can fix on its own.
 | `Endpoint <name> does not exist`                                       | Run `databricks ... serving-endpoints list` and pick a real endpoint name; then `./living-ai-deploy.pex configure`.        |
 | `Could not find env entry for X in app.yaml`                           | The bundled `app.yaml` is out of sync with the deployer. Rebuild the .pex (Section 10).                                    |
 | `bundle deploy` fails with a Terraform error                           | Install Terraform 1.5+ and put it on your `PATH`.                                                                          |
-| Agent runs but never replies on Telegram                               | Re-run the deployer and answer `y` to "Update Telegram…" and `Y` to "Set webhook"; confirm the handle has no leading `@`.  |
+| Agent runs but never replies on Telegram                               | See "Telegram bot doesn't respond" below.                                                                                  |
 | You want to wipe and start over                                        | `./living-ai-deploy.pex uninstall`, then `./living-ai-deploy.pex --reset`.                                                 |
+
+### Telegram bot doesn't respond
+
+The agent uses long-polling (Section 8), so a working setup needs three
+things: app is running, bot has no webhook registered, and the message comes
+from the configured primary user.
+
+Diagnose in order:
+
+```bash
+# 1. App is RUNNING + ACTIVE?
+databricks --profile <profile> apps get <app_name> \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); \
+       print('app:', d['app_status']['state']); \
+       print('compute:', d['compute_status']['state'])"
+# Expected: app: RUNNING / compute: ACTIVE
+```
+
+```bash
+# 2. No webhook registered? (long-polling requires this)
+curl -sS "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo" | jq .
+# Expected: "url": ""  (empty string)
+# If "url" is non-empty, something re-registered it. Clear it:
+curl -sS -X POST "https://api.telegram.org/bot<BOT_TOKEN>/deleteWebhook" -d 'drop_pending_updates=false'
+# Then redeploy: ./living-ai-deploy.pex configure
+```
+
+```bash
+# 3. Are you DM'ing as the primary user?
+./living-ai-deploy.pex --print-config | grep telegram_user_handle
+# If you DM from a different Telegram username, the agent replies with
+# "Sorry, I only respond to @<handle>." Change it via reconfigure.
+```
+
+```bash
+# 4. Is polling actually running? Tail the app logs (needs OAuth profile).
+databricks --profile <oauth-profile> apps logs <app_name> | tail -100
+# Look for: "agent <name> online; ... telegram=polling"
+# If you see "telegram=pending", the bot token secret isn't readable —
+# re-run reconfigure and answer Y to "Update Telegram bot token / handle?"
+```
+
+If you previously set a webhook against the App URL and Telegram is still
+flagging `last_error_message: "Wrong response from the webhook: 302 Found"`,
+that's the OAuth gate rejecting Telegram's request. The fix is the polling
+mode this deployer ships with — just redeploy with the latest .pex, which
+automatically clears any stale webhook on startup.
 
 ---
 
