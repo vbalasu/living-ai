@@ -30,12 +30,23 @@ if ! command -v "$PEX_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Allow callers to override the package index (corp proxies, local mirrors)
+# and the pip version used by pex's bootstrap.
+EXTRA_PEX_ARGS=()
+if [ -n "${PIP_INDEX_URL:-}" ]; then
+  EXTRA_PEX_ARGS+=(--no-pypi --index "$PIP_INDEX_URL")
+fi
+if [ -n "${PEX_PIP_VERSION:-}" ]; then
+  EXTRA_PEX_ARGS+=(--pip-version "$PEX_PIP_VERSION")
+fi
+
 "$PEX_BIN" \
   --venv prepend \
   -D . \
   -P "living_ai_deploy=living_ai_deploy" \
   databricks-sdk==0.40.0 \
   -e living_ai_deploy.deployer:main \
+  "${EXTRA_PEX_ARGS[@]}" \
   -o "$OUT"
 
 echo "Built: $OUT"

@@ -45,7 +45,7 @@ manually — Python knows how to run it directly. Just make it executable:
 chmod +x living-ai-deploy.pex
 ```
 
-> Want to inspect or rebuild it? See [Section 9](#9-rebuilding-the-deployer).
+> Want to inspect or rebuild it? See [Section 10](#10-rebuilding-the-deployer).
 
 ---
 
@@ -81,9 +81,10 @@ The deployer then:
 1. Writes the CLI profile to `~/.databrickscfg`
 2. Stores Telegram secrets in Databricks Secrets
 3. Extracts the bundled Asset Bundle and substitutes your config into it
-4. Runs `databricks bundle deploy` to provision the App, Lakebase, volumes, and tables
-5. Runs the Lakebase setup job
-6. Registers the Telegram webhook
+4. Runs `databricks bundle deploy` to provision the App, schema, volumes, and serving-endpoint binding
+5. Runs `databricks bundle run living_ai_app` to start the App compute and deploy the source code
+6. Runs the Lakebase setup job
+7. Registers the Telegram webhook (if you said yes)
 
 A non-secret snapshot of your answers is saved to `~/.living-ai/config.json` so
 that subsequent runs can prefill defaults.
@@ -282,29 +283,67 @@ rm -rf ~/.living-ai
 
 ---
 
-## 8. Troubleshooting
+## 8. Known limitation: Telegram webhook + Databricks Apps auth
+
+By default, Databricks Apps require workspace-level OAuth on every route.
+Telegram cannot follow OAuth redirects, so its `POST /telegram/webhook` calls
+get a `302 Found` and the bot never reaches the agent. You can confirm this
+by polling the bot's webhook info:
+
+```bash
+curl -sS "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo" | jq .
+# look for: "last_error_message": "Wrong response from the webhook: 302 Found"
+```
+
+The agent's **autonomous heartbeat / idle-reflection loop still runs** — that's
+all internal cognition, no inbound channel needed. Internal events show up in
+the Lakebase event log; the deployer's qwen3 endpoint validation step proves
+the cognition path works end-to-end.
+
+To unblock Telegram, either:
+- ask a workspace admin to enable unauthenticated app routes (workspace
+  setting; not configurable from the bundle), or
+- front the App with a public proxy (Cloud Run, Cloudflare Worker, etc.) that
+  forwards `/telegram/webhook` to the App after attaching a Databricks OAuth
+  token.
+
+This is a workspace-level constraint, not something the deployer or bundle
+can fix on its own.
+
+---
+
+## 9. Troubleshooting
 
 | Symptom                                                                | Fix                                                                                                                        |
 | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `databricks CLI not found`                                             | Install Databricks CLI from the docs link above                                                                            |
 | `PERMISSION_DENIED ... rate limit of 0`                                | Default Qwen endpoint should work on Free Edition. If you changed to a non-OSS FMAPI model, switch back or set up an external endpoint (Section 4). |
 | `Endpoint <name> does not exist`                                       | Run `databricks ... serving-endpoints list` and pick a real endpoint name; then `./living-ai-deploy.pex configure`.        |
-| `Could not find env entry for X in app.yaml`                           | The bundled `app.yaml` is out of sync with the deployer. Rebuild the .pex (Section 9).                                     |
+| `Could not find env entry for X in app.yaml`                           | The bundled `app.yaml` is out of sync with the deployer. Rebuild the .pex (Section 10).                                    |
 | `bundle deploy` fails with a Terraform error                           | Install Terraform 1.5+ and put it on your `PATH`.                                                                          |
 | Agent runs but never replies on Telegram                               | Re-run the deployer and answer `y` to "Update Telegram…" and `Y` to "Set webhook"; confirm the handle has no leading `@`.  |
 | You want to wipe and start over                                        | `./living-ai-deploy.pex uninstall`, then `./living-ai-deploy.pex --reset`.                                                 |
 
 ---
 
-## 9. Rebuilding the deployer
+## 10. Rebuilding the deployer
 
 Only needed if you change anything under `agent/src/`, `agent/resources/`, or
 `agent/databricks.yml`. The build script copies fresh sources into the .pex.
 
 ```bash
 cd agent/deploy
-pip install --user pex          # one-time
+pipx install pex                # one-time (or: pip install --user pex)
 ./build.sh                      # writes ../../living-ai-deploy.pex
+```
+
+If your network blocks the public PyPI (corporate proxy, etc.), pass the
+proxy URL and a pre-installed pip version that pex can find:
+
+```bash
+PIP_INDEX_URL=https://pypi-proxy.your-org/simple \
+  PEX_PIP_VERSION=26.0.1 \
+  ./build.sh
 ```
 
 The build script bundles:

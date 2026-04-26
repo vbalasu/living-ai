@@ -535,7 +535,7 @@ def run_deploy(reset: bool) -> None:
         print("Aborted.")
         return
 
-    total = 5
+    total = 6
 
     print(f"\n[1/{total}] Configure CLI profile")
     if reuse_creds:
@@ -572,7 +572,11 @@ def run_deploy(reset: bool) -> None:
     run_databricks(cli, ["bundle", "deploy", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    print(f"\n[5/{total}] Run Lakebase setup job")
+    print(f"\n[5/{total}] Start app + deploy code")
+    run_databricks(cli, ["bundle", "run", "living_ai_app", "-t", "free"] + var_args,
+                   profile=profile, tf_exec_path=tf, cwd=bundle_dir)
+
+    print(f"\n[6/{total}] Run Lakebase setup job")
     run_databricks(cli, ["bundle", "run", "setup_tables", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
