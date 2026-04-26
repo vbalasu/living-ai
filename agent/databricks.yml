@@ -42,8 +42,10 @@ targets:
   free:
     default: true
     workspace:
-      host: https://dbc-d5a49298-395d.cloud.databricks.com
-      profile: free
+      # No host: pinned here — the host comes from the CLI profile the
+      # installer writes to ~/.databrickscfg. Pinning a host would lock the
+      # bundle to one specific workspace.
+      profile: living-ai
     variables:
       heartbeat_seconds: 120
       daily_token_cap: 100000
@@ -51,8 +53,7 @@ targets:
   prod:
     mode: production
     workspace:
-      host: https://dbc-d5a49298-395d.cloud.databricks.com
-      profile: free
+      profile: living-ai
     variables:
       heartbeat_seconds: 60
       daily_token_cap: 500000

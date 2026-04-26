@@ -44,7 +44,7 @@ fi
   --venv prepend \
   -D . \
   -P "living_ai_deploy=living_ai_deploy" \
-  databricks-sdk==0.40.0 \
+  databricks-sdk==0.105.0 \
   -e living_ai_deploy.deployer:main \
   "${EXTRA_PEX_ARGS[@]}" \
   -o "$OUT"

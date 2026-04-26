@@ -78,14 +78,82 @@ def extract_bundle(target_dir: Path) -> None:
 
 # --- prereqs ---
 
-def check_prereqs() -> tuple[str, str | None]:
+def _platform_install_cmd_for_databricks() -> tuple[str, list[str]] | None:
+    """Return (label, [shell-cmd, …]) for installing Databricks CLI on this OS."""
+    if sys.platform == "darwin":
+        if shutil.which("brew"):
+            return ("Homebrew", ["bash", "-lc", "brew tap databricks/tap && brew install databricks"])
+        return None
+    if sys.platform.startswith("linux"):
+        return ("Databricks setup-cli script (requires sudo)",
+                ["bash", "-lc",
+                 "curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sudo sh"])
+    return None
+
+
+def ensure_databricks_cli() -> str:
+    """Find or install the Databricks CLI. Returns the path to the binary."""
+    cli = shutil.which("databricks")
+    if cli:
+        return cli
+
+    print()
+    print("  Databricks CLI is required but not found on your PATH.")
+    install = _platform_install_cmd_for_databricks()
+    if install is None:
+        print()
+        print("  No automatic install available for this platform. Install manually:")
+        print("    https://docs.databricks.com/dev-tools/cli/install.html")
+        print("  Then re-run this installer.")
+        sys.exit(2)
+
+    label, cmd = install
+    print(f"  I can install it via {label}:")
+    print(f"    {cmd[-1]}")
+    print()
+    if not prompts.ask_yn("  Install Databricks CLI now?", default=True):
+        print()
+        print("  Install it manually and re-run this installer:")
+        print("    https://docs.databricks.com/dev-tools/cli/install.html")
+        sys.exit(2)
+
+    print()
+    print("  Running install (you may be prompted for your password)...")
+    print()
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print()
+        print("  Install command exited non-zero. Try installing manually and re-run:")
+        print("    https://docs.databricks.com/dev-tools/cli/install.html")
+        sys.exit(2)
+
     cli = shutil.which("databricks")
     if not cli:
-        print("\nERROR: 'databricks' CLI not found on PATH.", file=sys.stderr)
-        print("Install: https://docs.databricks.com/dev-tools/cli/install.html", file=sys.stderr)
+        # PATH may not have refreshed in this shell; try common Homebrew + setup-cli locations.
+        for candidate in ("/opt/homebrew/bin/databricks", "/usr/local/bin/databricks", "/usr/bin/databricks"):
+            if Path(candidate).exists():
+                cli = candidate
+                break
+    if not cli:
+        print()
+        print("  Databricks CLI installed but isn't on this shell's PATH yet.")
+        print("  Open a new terminal and re-run the installer.")
         sys.exit(2)
-    tf = shutil.which("terraform")
-    return cli, tf
+
+    print(f"  ✓ Databricks CLI ready at {cli}")
+    return cli
+
+
+def check_prereqs() -> str:
+    """Make sure Databricks CLI is available; install with consent if not.
+
+    Terraform is not required as a separate dependency — the Databricks CLI
+    bundles its own terraform downloader and uses it transparently. If the
+    operator already has a terraform binary on PATH, run_databricks() will
+    point the CLI at it (faster + avoids any download issues), but it isn't
+    required.
+    """
+    return ensure_databricks_cli()
 
 
 # --- saved config snapshot (no secrets) ---
@@ -199,6 +267,67 @@ def ensure_secrets(w: WorkspaceClient, scope: str, kvs: dict[str, str]) -> None:
             print(f"  set secret '{scope}/{k}'")
 
 
+def _instance_state(inst) -> str:
+    """Normalize a DatabaseInstance.state value to a bare string like 'AVAILABLE'."""
+    raw = getattr(inst, "state", None) or getattr(inst, "lifecycle_state", None)
+    if raw is None:
+        return ""
+    # SDK returns an enum; .value works for that, str() works for plain strings.
+    s = getattr(raw, "value", None) or str(raw)
+    # str() on an enum yields 'DATABASEINSTANCESTATE.AVAILABLE'; trim that prefix.
+    return s.split(".")[-1].upper()
+
+
+def ensure_lakebase_instance(w: WorkspaceClient, instance_name: str,
+                             capacity: str = "CU_1", timeout_seconds: int = 600) -> None:
+    """Make sure a Lakebase Postgres instance exists, creating + waiting if needed."""
+    import time
+
+    try:
+        existing = w.database.get_database_instance(instance_name)
+        state = _instance_state(existing)
+        print(f"  Lakebase instance '{instance_name}' already exists (state: {state or '?'})")
+        if state == "AVAILABLE":
+            return
+        # Otherwise fall through and wait below.
+    except Exception:
+        # Doesn't exist — create it.
+        print(f"  creating Lakebase instance '{instance_name}' (capacity {capacity}) …")
+        try:
+            from databricks.sdk.service.database import DatabaseInstance
+            w.database.create_database_instance(
+                DatabaseInstance(name=instance_name, capacity=capacity),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not create Lakebase instance '{instance_name}': {exc}"
+            ) from exc
+
+    print(f"  waiting for Lakebase instance to become AVAILABLE (this can take ~3-5 minutes) …")
+    deadline = time.time() + timeout_seconds
+    last_state = None
+    while time.time() < deadline:
+        try:
+            inst = w.database.get_database_instance(instance_name)
+            state = _instance_state(inst)
+            if state != last_state:
+                print(f"    state: {state or '?'}")
+                last_state = state
+            if state == "AVAILABLE":
+                return
+            if state in ("FAILED", "DELETING", "DELETED"):
+                raise RuntimeError(f"Lakebase instance '{instance_name}' is in state {state}")
+        except Exception as exc:
+            if "not found" in str(exc).lower():
+                pass
+            else:
+                print(f"    poll error: {exc}")
+        time.sleep(15)
+    raise RuntimeError(
+        f"Timed out after {timeout_seconds}s waiting for Lakebase instance '{instance_name}'"
+    )
+
+
 def read_secret(w: WorkspaceClient, scope: str, key: str) -> str | None:
     try:
         raw = w.secrets.get_secret(scope=scope, key=key).value
@@ -268,6 +397,22 @@ def bundle_var_args(snapshot: dict) -> list[str]:
 
 
 # --- substitution ---
+
+def substitute_bundle_profile(bundle_dir: Path, profile: str) -> None:
+    """Patch databricks.yml so workspace.profile matches the CLI profile we just configured.
+
+    Without this, a user installing into a workspace different from the one baked
+    into the shipped bundle YAML hits "host in profile doesn't match host in bundle".
+    """
+    db_yml = bundle_dir / "databricks.yml"
+    text = db_yml.read_text()
+    pattern = re.compile(r"^(\s*profile:\s*)\S+$", re.MULTILINE)
+    new_text, count = pattern.subn(rf"\g<1>{profile}", text)
+    if count == 0:
+        # No profile line found; harmless — the --profile CLI flag will be used.
+        return
+    db_yml.write_text(new_text)
+
 
 def substitute_app_yaml(bundle_dir: Path, snapshot: dict) -> None:
     """Inject runtime config values into src/app.yaml so the App env reflects user input."""
@@ -424,56 +569,84 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
             print("  Sensible defaults are used for everything else. To see and edit")
             print("  every setting, re-run with --advanced.")
 
-    cli, tf = check_prereqs()
+    cli = check_prereqs()
+    tf = shutil.which("terraform")
     print()
-    print(f"  found: databricks CLI ({cli})")
-    print(f"  found: terraform     ({tf or 'NOT FOUND — bundle deploy may need it'})")
+    print(f"  Databricks CLI:  {cli}")
+    if tf:
+        print(f"  Terraform:       {tf} (will be used for faster bundle deploys)")
+    else:
+        print(f"  Terraform:       not installed — Databricks CLI will fetch it on demand")
 
     # ===== Block 1: Databricks workspace =====
     _section("1. Databricks workspace")
     _explain(
         "The agent runs as a Databricks App. Free Edition works fine — no",
-        "credit card needed. We need two things:",
+        "credit card needed.",
         "",
-        "  • Your workspace URL (looks like https://dbc-xxxx.cloud.databricks.com)",
-        "  • A Personal Access Token so the installer can deploy on your behalf",
+        "  Don't have a workspace yet? Sign up free in ~2 minutes:",
+        "    https://www.databricks.com/learn/free-edition",
+        "    (no credit card; OSS LLMs are included so the agent runs at no cost)",
         "",
-        "  Don't have a token? Make one in 30 seconds:",
-        "    1. Open your workspace URL in a browser",
-        "    2. Top-right avatar → Settings → Developer → Access tokens → Generate",
-        "    3. Copy the token (starts with 'dapi...')",
+        "  Where to find your workspace URL:",
+        "    Sign in to Databricks. The browser address bar shows something like",
+        "      https://dbc-xxxxxxxx-yyyy.cloud.databricks.com    (AWS Free Edition)",
+        "      https://adb-xxxxxxxxx.x.azuredatabricks.net       (Azure)",
+        "    Copy that URL (the part up to .com / .net).",
+        "",
+        "  How to create a Personal Access Token (~30 seconds):",
+        "    1. In your workspace, click the avatar (top-right) → Settings",
+        "    2. Pick Developer → Access tokens → 'Generate new token'",
+        "    3. Pick a name (e.g. 'living-ai'), set lifetime, click Generate",
+        "    4. Copy the token (starts with 'dapi...') — you only see it once",
     )
 
     profile_default = saved.get("profile", "living-ai")
     if advanced:
-        profile = prompts.ask("CLI profile name to write", default=profile_default)
+        profile = prompts.ask("CLI profile name to write to ~/.databrickscfg", default=profile_default)
     else:
         profile = profile_default
 
     existing_host = existing_profile(profile)
     reuse_creds = False
     if existing_host:
-        print(f"  Found existing Databricks CLI profile '{profile}' for {existing_host}")
+        print(f"  Found existing Databricks CLI profile '{profile}' pointing at:")
+        print(f"    {existing_host}")
         reuse_creds = prompts.ask_yn(
-            "  Use those credentials? (no = enter new ones)", default=True
+            "  Use this existing profile? (no = enter a new workspace + token)",
+            default=True,
         )
 
     if reuse_creds:
         host = existing_host
         pat = ""
-    else:
+        # Sanity-check: confirm the existing profile still works.
+        print("  testing existing profile...")
+        try:
+            w_test = WorkspaceClient(profile=profile)
+            me = w_test.current_user.me()
+            user = getattr(me, "user_name", None) or getattr(me, "display_name", "?")
+            print(f"  ✓ profile works; signed in as {user}")
+        except Exception as exc:
+            print(f"  ✗ existing profile failed: {exc}")
+            print("    Falling back to entering a new workspace + token.")
+            reuse_creds = False
+            existing_host = None
+
+    if not reuse_creds:
+        host_default = existing_host if existing_host and not saved else None
         host = prompts.ask(
             "Workspace URL (https://...)",
-            default=saved.get("host", existing_host),
+            default=host_default,
             validate=prompts.validate_host,
-        )
+        ).rstrip("/")
         while True:
             pat = prompts.ask(
                 "Personal access token (input is hidden)",
                 secret=True,
                 validate=prompts.validate_pat,
             )
-            print("  validating token against the workspace...")
+            print("  testing token against the workspace...")
             err = _validate_pat_live(host, pat)
             if err is None:
                 break
@@ -485,28 +658,54 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
     # ===== Block 2: Telegram bot =====
     _section("2. Telegram bot")
     _explain(
-        "You'll DM the agent on Telegram. We need:",
+        "You'll talk to the agent on Telegram. We need two things:",
         "",
-        "  • A bot token from @BotFather  (takes 30 seconds, see below)",
-        "  • Your Telegram username       (the agent only replies to you)",
+        "  • A bot token from @BotFather (a Telegram-provided helper bot)",
+        "  • Your own Telegram username  (so the agent only replies to you)",
         "",
-        "  How to make a bot:",
-        "    1. Open Telegram and DM @BotFather",
-        "    2. Send /newbot, pick a display name, then a unique username",
-        "       ending in 'bot' (e.g. agent_april_bot)",
-        "    3. Copy the token BotFather replies with (numbers:letters format)",
+        "  How to create a bot — takes ~30 seconds:",
+        "    1. Open Telegram and DM @BotFather  https://t.me/BotFather",
+        "    2. Send  /newbot",
+        "    3. Pick a display name (anything, e.g. 'My Living-AI Agent')",
+        "    4. Pick a username — must be unique and end with 'bot'",
+        "       (e.g.  april_living_ai_bot)",
+        "    5. BotFather replies with a token like  123456:AAH...xyz",
+        "    6. Copy that whole token and paste it below",
+        "",
+        "  How to find your own Telegram username:",
+        "    Telegram → tap the menu (≡) → tap your name at the top",
+        "    Look for the line  'Username  @your_username'",
+        "    Don't have one yet? Tap 'Username' and create one (letters/digits/underscores).",
     )
 
+    # See if we already have a working bot in Databricks Secrets from a prior install.
+    existing_bot_username = ""
+    existing_bot_token = ""
+    if saved and reuse_creds:
+        try:
+            tmp_w = WorkspaceClient(profile=profile)
+            existing_bot_token = read_secret(tmp_w, saved.get("secrets_scope", "living_ai"),
+                                             "telegram_bot_token") or ""
+            if existing_bot_token:
+                info = telegram_get_me(existing_bot_token)
+                if info and info.get("username"):
+                    existing_bot_username = info["username"]
+        except Exception:
+            existing_bot_token = ""
+
     bot_token = ""
-    skip_telegram_secrets = False
-    if saved:
-        skip_telegram_secrets = not prompts.ask_yn(
-            "Rotate Telegram bot token? (no = keep existing)", default=False
+    rotate_bot = True
+    if existing_bot_username:
+        print(f"  Currently connected to bot @{existing_bot_username}.")
+        rotate_bot = prompts.ask_yn(
+            "  Use a different bot? (no = keep this one)",
+            default=False,
         )
-    if not skip_telegram_secrets:
+
+    if rotate_bot:
         while True:
             bot_token = prompts.ask(
-                "Telegram bot token from @BotFather",
+                "Bot token from @BotFather",
                 secret=True,
                 validate=prompts.validate_telegram_token,
             )
@@ -519,9 +718,12 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
                 print("Aborted.", file=sys.stderr)
                 sys.exit(1)
 
+    # Telegram user handle: only show a default if we have one from the same workspace
+    # AND the user is reusing those credentials (i.e. we believe the saved value is theirs).
+    handle_default = saved.get("telegram_user_handle") if (saved and reuse_creds) else None
     user_handle = prompts.ask(
         "Your Telegram username (without the @)",
-        default=saved.get("telegram_user_handle"),
+        default=handle_default,
     ).lstrip("@")
 
     # ===== Block 3: Agent personality =====
@@ -624,7 +826,7 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
         return
 
     # ===== Apply =====
-    total = 6
+    total = 7
 
     _section(f"[1/{total}] Configure Databricks CLI profile")
     if reuse_creds:
@@ -637,34 +839,32 @@ def run_deploy(reset: bool, advanced: bool = False) -> None:
     w = WorkspaceClient(profile=profile)
 
     _section(f"[2/{total}] Store secrets in Databricks Secrets")
-    secret_kvs: dict[str, str] = {}
-    if not skip_telegram_secrets:
-        secret_kvs.update({
-            "telegram_bot_token": bot_token,
-            "telegram_primary_user_handle": user_handle,
-        })
-    if not secret_kvs:
-        print("  no secrets to update (kept existing)")
-    else:
-        ensure_secrets(w, secrets_scope, secret_kvs)
+    secret_kvs: dict[str, str] = {"telegram_primary_user_handle": user_handle}
+    if rotate_bot and bot_token:
+        secret_kvs["telegram_bot_token"] = bot_token
+    ensure_secrets(w, secrets_scope, secret_kvs)
 
-    _section(f"[3/{total}] Prepare deployment bundle")
+    _section(f"[3/{total}] Provision Lakebase Postgres instance")
+    ensure_lakebase_instance(w, lakebase_name)
+
+    _section(f"[4/{total}] Prepare deployment bundle")
     bundle_dir = Path(tempfile.mkdtemp(prefix="living-ai-bundle-"))
     extract_bundle(bundle_dir)
+    substitute_bundle_profile(bundle_dir, profile)
     substitute_app_yaml(bundle_dir, snapshot)
     print(f"  bundle ready")
 
     var_args = bundle_var_args(snapshot)
 
-    _section(f"[4/{total}] Provision Databricks resources (App, Lakebase, schema)")
+    _section(f"[5/{total}] Provision Databricks resources (App, schema, volumes)")
     run_databricks(cli, ["bundle", "deploy", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    _section(f"[5/{total}] Start the app and deploy the code")
+    _section(f"[6/{total}] Start the app and deploy the code")
     run_databricks(cli, ["bundle", "run", "living_ai_app", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
-    _section(f"[6/{total}] Initialize the conversation memory tables")
+    _section(f"[7/{total}] Initialize the conversation memory tables")
     run_databricks(cli, ["bundle", "run", "setup_tables", "-t", "free"] + var_args,
                    profile=profile, tf_exec_path=tf, cwd=bundle_dir)
 
@@ -747,7 +947,8 @@ def run_uninstall() -> None:
         print("If you deployed manually, run `databricks bundle destroy` from the bundle dir.")
         sys.exit(1)
 
-    cli, tf = check_prereqs()
+    cli = check_prereqs()
+    tf = shutil.which("terraform")
 
     profile = saved["profile"]
     app_name = saved["app_name"]
@@ -764,7 +965,7 @@ def run_uninstall() -> None:
     print("Plan:")
     print(f"  Run `databricks bundle destroy` for app '{app_name}'")
     print(f"  Catalog/schema:  {catalog}.{schema} (volumes + tables removed by bundle destroy)")
-    print(f"  Lakebase:        {lakebase} (removed by bundle destroy)")
+    print(f"  Lakebase:        {lakebase} — choose below whether to delete the instance too")
     print(f"  Secrets scope:   {secrets_scope}")
     print(f"  Saved config:    {CONFIG_FILE}")
     print()
@@ -781,6 +982,11 @@ def run_uninstall() -> None:
         sys.exit(1)
 
     delete_webhook = prompts.ask_yn("Delete the Telegram webhook?", default=True)
+    delete_lakebase = prompts.ask_yn(
+        f"Delete the Lakebase instance '{lakebase}'? "
+        f"(this also deletes all conversation history)",
+        default=True,
+    )
     delete_scope = prompts.ask_yn(
         f"Delete the entire secrets scope '{secrets_scope}'?",
         default=False,
@@ -810,6 +1016,7 @@ def run_uninstall() -> None:
     print("\n[2] Bundle destroy")
     bundle_dir = Path(tempfile.mkdtemp(prefix="living-ai-bundle-"))
     extract_bundle(bundle_dir)
+    substitute_bundle_profile(bundle_dir, profile)
     substitute_app_yaml(bundle_dir, saved)
     var_args = bundle_var_args(saved)
     try:
@@ -820,6 +1027,14 @@ def run_uninstall() -> None:
     except RuntimeError as exc:
         print(f"  bundle destroy reported a failure: {exc}")
         print("  (some resources may have already been removed; continuing)")
+
+    if delete_lakebase:
+        print(f"\n[3a] Deleting Lakebase instance '{lakebase}'")
+        try:
+            w.database.delete_database_instance(name=lakebase, purge=True)
+            print(f"  deleted Lakebase instance '{lakebase}'")
+        except Exception as exc:
+            print(f"  could not delete Lakebase instance '{lakebase}': {exc}")
 
     if delete_scope:
         print("\n[3] Deleting secrets scope")

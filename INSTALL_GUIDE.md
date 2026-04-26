@@ -25,33 +25,33 @@ The installer is a Python `.pex` file — a self-extracting Python executable.
 PEX runs natively on macOS and Linux. **On Windows, you need WSL2** (Windows
 Subsystem for Linux); PEX does not support running directly on Windows.
 
-You'll need three local tools regardless of OS:
+You'll need:
 
-- Python 3.11+
-- Databricks CLI
-- Terraform 1.5+
+- **Python 3.11+** — usually already installed; check with `python3 --version`
+- **Databricks CLI** — the installer will offer to install this for you on
+  first run, or install it yourself ahead of time using the OS-specific
+  command below
+
+Terraform is **not required** — the Databricks CLI bundles its own copy of
+Terraform and uses it transparently. (If you happen to have a `terraform` on
+PATH, the installer will use it — that's faster than the CLI's first-time
+download — but it isn't required.)
 
 ### macOS
 
 ```bash
 brew install python@3.11
 brew tap databricks/tap && brew install databricks
-brew install terraform
 ```
 
 ### Linux
 
 ```bash
 # Python (usually already installed)
-sudo apt install -y python3
+sudo apt install -y python3 curl
 
 # Databricks CLI
 curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sudo sh
-
-# Terraform
-curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-sudo apt update && sudo apt install -y terraform
 ```
 
 ### Windows (via WSL2)
@@ -68,23 +68,25 @@ One-time setup:
    create a Linux username/password.
 
 3. From the Ubuntu prompt, install the same tools as the Linux section above
-   (Python, Databricks CLI, Terraform).
+   (Python, Databricks CLI).
 
-4. Navigate to where you saved the `.pex` file. WSL mounts your Windows
-   drives under `/mnt/`, so `C:\Users\you\Downloads\` is at
-   `/mnt/c/Users/you/Downloads/`:
+4. Move the downloaded `.pex` from your Windows downloads into your WSL home
+   directory before running it. The WSL `/mnt/c/...` mount doesn't honor
+   `chmod +x`, so executing from there fails:
    ```bash
-   cd /mnt/c/Users/<your-windows-username>/Downloads
+   mv /mnt/c/Users/<your-windows-username>/Downloads/living-ai-deploy.pex ~/
+   cd ~
    ```
 
 You'll also need:
 
-- A **Databricks workspace** (Free Edition is fine — no credit card needed —
-  sign up at <https://www.databricks.com/learn/free-edition>) and a
-  **Personal Access Token** from that workspace
+- A **Databricks workspace** — Free Edition is fine (no credit card needed):
+  sign up at <https://www.databricks.com/learn/free-edition>
+- A **Personal Access Token** from that workspace
 - A **Telegram bot** created via [@BotFather](https://t.me/BotFather)
   (`/newbot`, pick a name, copy the token)
-- Your **Telegram username** (without the `@`)
+- Your **Telegram username** (without the `@`) — find it in Telegram → menu
+  (≡) → your name at top → **Username**
 
 ---
 
@@ -321,8 +323,8 @@ Practical implications:
 
 | Symptom                                                                | Fix                                                                                                                        |
 | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `databricks CLI not found`                                             | Install Databricks CLI from the per-OS instructions in Section 1                                                           |
-| `bundle deploy` fails with a Terraform error                           | Install Terraform 1.5+ and put it on your `PATH`                                                                           |
+| `databricks CLI not found`                                             | The installer offers to install it for you (default Y). Or install manually per Section 1                                  |
+| `bundle deploy` fails with `unable to verify checksums signature: openpgp: key expired` | Databricks CLI's bundled terraform downloader hit an expired GPG key. Install Terraform yourself: `brew install terraform` (macOS) or `sudo apt install terraform` (after the HashiCorp APT repo). |
 | `token check failed: ... 401`                                          | The PAT is invalid or expired. Generate a new one in the Databricks UI                                                     |
 | `couldn't reach Telegram with that token`                              | Token is wrong or revoked. Re-create it via @BotFather (`/token` command lists existing tokens)                            |
 | `PERMISSION_DENIED ... rate limit of 0`                                | Default Qwen endpoint should work on Free Edition. If you changed to a non-OSS FMAPI model, switch back or set up external (Section 5) |
