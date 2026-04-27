@@ -7,7 +7,11 @@ exchanges across restarts.
 
 ![Living-AI overview](./infographic.png)
 
-[![Watch the demo](https://img.youtube.com/vi/D6cVKe2nQZc/maxresdefault.jpg)](https://youtu.be/D6cVKe2nQZc)
+### ▶️ Watch the 2-minute demo
+
+[![Watch the demo on YouTube](https://img.youtube.com/vi/D6cVKe2nQZc/maxresdefault.jpg)](https://youtu.be/D6cVKe2nQZc)
+
+**[▶️ Click here to watch on YouTube](https://youtu.be/D6cVKe2nQZc)**
 
 ## Quickstart (3 steps)
 
