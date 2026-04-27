@@ -5,6 +5,8 @@ you on Telegram. Runs free on Databricks Free Edition — uses an open-source
 LLM (Qwen 3) hosted by Databricks, so no LLM bills. Remembers the last 60
 exchanges across restarts.
 
+![Living-AI overview](./infographic.png)
+
 ## Quickstart (3 steps)
 
 ### 1. Download
