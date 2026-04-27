@@ -7,6 +7,8 @@ exchanges across restarts.
 
 ![Living-AI overview](./infographic.png)
 
+[![Watch the demo](https://img.youtube.com/vi/D6cVKe2nQZc/maxresdefault.jpg)](https://youtu.be/D6cVKe2nQZc)
+
 ## Quickstart (3 steps)
 
 ### 1. Download
